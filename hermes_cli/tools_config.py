@@ -1292,6 +1292,20 @@ def _get_platform_tools(
     include_default_mcp_servers: bool = True,
 ) -> Set[str]:
     """Resolve which individual toolset names are enabled for a platform."""
+    if os.environ.get("DESKPILOT_MODE") == "1" and platform in {
+        "acp",
+        "cli",
+        "cron",
+        "telegram",
+        "signal",
+    }:
+        configured = (config.get("platform_toolsets") or {}).get(platform)
+        if configured != ["deskpilot", "no_mcp"]:
+            raise RuntimeError(
+                f"DeskPilot {platform} requires [deskpilot,no_mcp]"
+            )
+        return {"deskpilot"}
+
     from toolsets import resolve_toolset, TOOLSETS
 
     platform_toolsets = config.get("platform_toolsets") or {}

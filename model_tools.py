@@ -262,6 +262,12 @@ _tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
 _TOOL_DEFS_CACHE_MAX = 8
 
 
+def _is_closed_deskpilot_surface(enabled_toolsets: object) -> bool:
+    if os.environ.get("DESKPILOT_MODE") != "1" or enabled_toolsets is None:
+        return False
+    return list(enabled_toolsets) == ["deskpilot"]
+
+
 def _clear_tool_defs_cache() -> None:
     """Drop memoized get_tool_definitions() results. Called when dynamic
     schema dependencies change (e.g. discord capability cache reset,
@@ -315,6 +321,11 @@ def get_tool_definitions(
             registry._generation,
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
+            os.environ.get("DESKPILOT_MODE"),
+            bool(
+                _is_closed_deskpilot_surface(enabled_toolsets)
+                and not os.environ.get("HERMES_KANBAN_TASK")
+            ),
             bool(skip_tool_search_assembly),
         )
         cached = _tool_defs_cache.get(cache_key)
@@ -356,6 +367,7 @@ def _compute_tool_definitions(
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
     tools_to_include: set = set()
+    deskpilot_closed_surface = False
 
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
@@ -366,6 +378,9 @@ def _compute_tool_definitions(
             # (for token/cost reasons), but that should not strip the kanban
             # worker's completion/block/heartbeat surface.
             effective_enabled_toolsets.append("kanban")
+        deskpilot_closed_surface = _is_closed_deskpilot_surface(
+            effective_enabled_toolsets
+        )
         for toolset_name in effective_enabled_toolsets:
             if validate_toolset(toolset_name):
                 resolved = resolve_toolset(toolset_name)
@@ -516,7 +531,11 @@ def _compute_tool_definitions(
     try:
         from tools.tool_search import assemble_tool_defs, load_config as _load_ts_config
         ts_cfg = _load_ts_config()
-        if not skip_tool_search_assembly and ts_cfg.enabled != "off":
+        if (
+            not skip_tool_search_assembly
+            and not deskpilot_closed_surface
+            and ts_cfg.enabled != "off"
+        ):
             context_length = _resolve_active_context_length()
             assembly = assemble_tool_defs(
                 filtered_tools,

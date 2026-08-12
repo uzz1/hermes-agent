@@ -61,6 +61,13 @@ def _packaged_actions_path() -> Any:
     return located
 
 
+def load_packaged_action_registry() -> ActionRegistry:
+    """Load and validate the exact action registry shipped by DeskPilot."""
+    return ActionRegistry.from_yaml(
+        _packaged_actions_path(), PRECONDITIONS, POSTCONDITIONS
+    )
+
+
 class _BoundExecutor:
     def __init__(self, adapter: Any, action_id: str):
         self._adapter = adapter
@@ -103,9 +110,7 @@ class DeskPilotToolDispatcher:
         self._adapters = checked_adapters
         self._environment = dict(environment)
         self._approval = approval
-        self._registry = ActionRegistry.from_yaml(
-            _packaged_actions_path(), PRECONDITIONS, POSTCONDITIONS
-        )
+        self._registry = load_packaged_action_registry()
 
     def dispatch(
         self,
