@@ -21,6 +21,14 @@ EVENT_ID = "6d6fe658-0bd7-4086-9569-7e344cb3d285"
 CONSUMPTION_ID = "d10f4f35-18b8-48e9-a146-4e70f82ea19b"
 
 
+@pytest.fixture
+def tmp_path():
+    # Overrides pytest's tmp_path. Its per-user macOS root exceeds the 104-byte
+    # AF_UNIX sun_path limit, so binding a socket under it fails outright.
+    with tempfile.TemporaryDirectory(prefix="dp-policy-", dir="/private/tmp") as root:
+        yield Path(root)
+
+
 def response_for(request, **outcome):
     return {
         "protocol": "deskpilot.policy",
