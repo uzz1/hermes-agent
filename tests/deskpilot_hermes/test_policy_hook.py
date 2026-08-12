@@ -33,6 +33,56 @@ class FakeDispatcher:
         return self.result
 
 
+def test_direct_unchecked_entry_fails_closed_in_deskpilot_mode(monkeypatch):
+    dispatched = []
+    monkeypatch.setenv("DESKPILOT_MODE", "1")
+    monkeypatch.setattr(
+        model_tools.registry,
+        "dispatch",
+        lambda *_args, **_kwargs: dispatched.append(True) or '{"raw":true}',
+    )
+
+    result = model_tools._handle_function_call_unchecked("browser_open", {})
+
+    assert result == (
+        '{"ok":false,"error":"deskpilot.policy_denied",'
+        '"_meta":{"deskpilot":{"ruleID":"execute.denied",'
+        '"reason":"PermissionError"}}}'
+    )
+    assert dispatched == []
+
+
+def test_direct_unchecked_entry_preserves_ordinary_dispatch(monkeypatch):
+    calls = []
+    monkeypatch.delenv("DESKPILOT_MODE", raising=False)
+    monkeypatch.setattr(model_tools, "_READ_SEARCH_TOOLS", frozenset())
+    monkeypatch.setattr(
+        model_tools.registry,
+        "dispatch",
+        lambda name, args, **kwargs: (
+            calls.append((name, args, kwargs)) or '{"ordinary":true}'
+        ),
+    )
+
+    result = model_tools._handle_function_call_unchecked(
+        "dummy",
+        {"value": 1},
+        task_id="task",
+        user_task="ordinary user task",
+        skip_pre_tool_call_hook=True,
+        skip_tool_request_middleware=True,
+    )
+
+    assert result == '{"ordinary":true}'
+    assert calls == [
+        (
+            "dummy",
+            {"value": 1},
+            {"task_id": "task", "user_task": "ordinary user task"},
+        )
+    ]
+
+
 def test_ordinary_mode_forwards_every_signature_field_exactly(monkeypatch):
     captured = []
     public_signature = inspect.signature(model_tools.handle_function_call)

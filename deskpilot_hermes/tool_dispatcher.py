@@ -21,7 +21,7 @@ from deskpilot_hermes.integration import (
     _validate_execute_result,
 )
 from deskpilot_hermes.policy import PolicyReply
-from deskpilot_hermes.provenance import DeskPilotProvenance
+from deskpilot_hermes.provenance import DeskPilotProvenance, require_provenance
 from deskpilot_hermes.validation import validate_uuid
 
 
@@ -68,9 +68,7 @@ class _BoundExecutor:
 
     def invoke(self, inputs: dict[str, Any]) -> dict[str, Any]:
         observed = self._adapter.execute(self._action_id, _json_snapshot(inputs))
-        if not isinstance(observed, dict):
-            raise TypeError("adapter observations must be an object")
-        return observed
+        return _json_snapshot(observed)
 
 
 class _ConsumedGate:
@@ -122,6 +120,8 @@ class DeskPilotToolDispatcher:
                 raise ValueError("DeskPilot provenance required")
             if not isinstance(arguments, dict):
                 raise ValueError("arguments must be an object")
+            if require_provenance() != admitted.provenance:
+                raise ValueError("active provenance mismatch")
             mapping = TOOL_ACTIONS.get(tool_name)
             if mapping is None:
                 raise ValueError("unmapped tool")
@@ -151,6 +151,8 @@ class DeskPilotToolDispatcher:
                 authorization_result
             )
             decision = AuthorizationDecision.model_validate(decision_data)
+            if decision.risk != bound.spec.risk:
+                raise ValueError("authorization risk mismatch")
             if verdict == "deny":
                 raise ValueError("authorization denied")
             if verdict == "local_confirm" and admitted.provenance.entry_point != "ui":

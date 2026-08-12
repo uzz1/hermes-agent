@@ -1,9 +1,16 @@
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from datetime import UTC, datetime, timedelta
+from threading import Barrier
 
 import pytest
 
 from deskpilot_hermes.integration import AdmittedRequest
-from deskpilot_hermes.provenance import DeskPilotProvenance
+from deskpilot_hermes.provenance import (
+    DeskPilotProvenance,
+    provenance,
+    require_provenance,
+)
 from deskpilot_hermes.runtime_context import (
     PermissionOutcome,
     require_admitted_request,
@@ -128,6 +135,60 @@ def test_context_values_are_required_and_tokens_restore_prior_values():
         reset_trusted_user_request(request_token)
         reset_permission_requester(requester_token)
         reset_admitted_request(admitted_token)
+
+
+def test_copied_concurrent_contexts_keep_all_session_values_isolated():
+    barrier = Barrier(2)
+
+    def make_session(index):
+        trace_id = f"00000000-0000-0000-0000-{index:012d}"
+        admission_id = f"10000000-0000-0000-0000-{index:012d}"
+        admitted = AdmittedRequest(
+            DeskPilotProvenance("ui", f"local:{index}", trace_id), admission_id
+        )
+        requester = object()
+        dispatcher = object()
+        admitted_token = set_admitted_request(admitted)
+        requester_token = set_permission_requester(requester)
+        request_token = set_trusted_user_request(f"request-{index}")
+        dispatcher_token = set_tool_dispatcher(dispatcher)
+        try:
+            with provenance(admitted.provenance):
+                context = copy_context()
+        finally:
+            reset_tool_dispatcher(dispatcher_token)
+            reset_trusted_user_request(request_token)
+            reset_permission_requester(requester_token)
+            reset_admitted_request(admitted_token)
+
+        def observe():
+            barrier.wait()
+            return (
+                require_admitted_request(),
+                require_permission_requester(),
+                require_trusted_user_request(),
+                require_tool_dispatcher(),
+                require_provenance(),
+            )
+
+        return context, observe, admitted, requester, dispatcher
+
+    sessions = [make_session(1), make_session(2)]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(context.run, observe)
+            for context, observe, *_expected in sessions
+        ]
+        observed = [future.result() for future in futures]
+
+    for values, (_, _, admitted, requester, dispatcher) in zip(observed, sessions):
+        assert values == (
+            admitted,
+            requester,
+            f"request-{admitted.provenance.sender.removeprefix('local:')}",
+            dispatcher,
+            admitted.provenance,
+        )
 
 
 @pytest.mark.parametrize("value", [None, "", 0, [], {}])

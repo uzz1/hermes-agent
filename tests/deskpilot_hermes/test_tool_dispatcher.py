@@ -1,6 +1,9 @@
 from copy import deepcopy
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -8,7 +11,11 @@ from deskpilot.actions import ActionRegistry
 from deskpilot.execution import ExecutionDenied, action_digest
 from deskpilot_hermes.integration import AdmittedRequest
 from deskpilot_hermes.policy import PolicyReply
-from deskpilot_hermes.provenance import DeskPilotProvenance
+from deskpilot_hermes.provenance import (
+    DeskPilotProvenance,
+    copied_context_call,
+    provenance,
+)
 from deskpilot_hermes.tool_dispatcher import DeskPilotToolDispatcher
 
 
@@ -68,10 +75,14 @@ class FakePolicy:
 
 
 class ClosedAdapter:
-    def __init__(self, name, events=None, result=None, error=None):
+    _DEFAULT = object()
+
+    def __init__(self, name, events=None, result=_DEFAULT, error=None):
         self.name = name
         self.events = events if events is not None else []
-        self.result = result or {"browser_url_matches": True}
+        self.result = (
+            {"browser_url_matches": True} if result is self._DEFAULT else result
+        )
         self.error = error
         self.calls = []
 
@@ -105,6 +116,14 @@ def dispatcher(policy, *, browser=None, approval=lambda _auth: "capability-1"):
         {"browseros_ready": lambda _inputs: True},
         approval,
     )
+
+
+def dispatch_bound(
+    tool_dispatcher, request=None, tool_name="browser_open", arguments=ARGS
+):
+    request = request or admitted()
+    with provenance(request.provenance):
+        return tool_dispatcher.dispatch(request, tool_name, arguments)
 
 
 def test_dispatch_uses_parent_registry_and_exposes_no_raw_invoke_api():
@@ -190,11 +209,10 @@ def test_success_sends_exact_policy_calls_and_runs_pre_adapter_post(monkeypatch)
     )
     policy = FakePolicy([authorization(), execution()])
 
-    result = dispatcher(policy, browser=browser).dispatch(
-        admitted=admitted(), tool_name="browser_open", arguments=ARGS
-    )
+    result = dispatch_bound(dispatcher(policy, browser=browser))
 
-    assert result is browser.result
+    assert result == browser.result
+    assert result is not browser.result
     assert events == ["pre", "adapter", "post"]
     assert policy.calls == [
         (
@@ -228,9 +246,7 @@ def test_inputs_are_detached_from_caller_and_policy_mutation():
 
     browser = ClosedAdapter("browseros")
     policy = FakePolicy([authorization(), execution()], on_call=mutate_authorize)
-    dispatcher(policy, browser=browser).dispatch(
-        admitted=admitted(), tool_name="browser_open", arguments=caller_args
-    )
+    dispatch_bound(dispatcher(policy, browser=browser), arguments=caller_args)
 
     caller_args["url"] = "https://changed.invalid"
     assert browser.calls == [("browser.open", ARGS)]
@@ -243,7 +259,7 @@ def test_inputs_are_detached_from_caller_and_policy_mutation():
 def test_unmapped_or_invalid_action_denies_before_policy(tool_name, arguments):
     policy = FakePolicy([])
     with pytest.raises(ExecutionDenied):
-        dispatcher(policy).dispatch(admitted(), tool_name, arguments)
+        dispatch_bound(dispatcher(policy), tool_name=tool_name, arguments=arguments)
     assert policy.calls == []
 
 
@@ -270,8 +286,8 @@ def test_dispatch_requires_admitted_request_and_dict_arguments(bad_admitted):
 def test_authorization_transport_or_malformed_reply_denies_without_adapter(reply):
     browser = ClosedAdapter("browseros")
     with pytest.raises(ExecutionDenied):
-        dispatcher(FakePolicy([reply]), browser=browser).dispatch(
-            admitted(), "browser_open", ARGS
+        dispatch_bound(
+            dispatcher(FakePolicy([reply]), browser=browser),
         )
     assert browser.calls == []
 
@@ -281,9 +297,13 @@ def test_policy_deny_never_executes_or_requests_approval():
     browser = ClosedAdapter("browseros")
     policy = FakePolicy([authorization("deny")])
     with pytest.raises(ExecutionDenied):
-        dispatcher(
-            policy, browser=browser, approval=lambda value: approvals.append(value)
-        ).dispatch(admitted(), "browser_open", ARGS)
+        dispatch_bound(
+            dispatcher(
+                policy,
+                browser=browser,
+                approval=lambda value: approvals.append(value),
+            )
+        )
     assert browser.calls == []
     assert approvals == []
     assert [method for method, _ in policy.calls] == ["authorize"]
@@ -293,16 +313,20 @@ def test_local_confirm_requires_ui_but_ask_can_approve_remote():
     approvals = []
     local = FakePolicy([authorization("local_confirm")])
     with pytest.raises(ExecutionDenied):
-        dispatcher(local, approval=lambda value: approvals.append(value)).dispatch(
-            admitted("telegram"), "browser_open", ARGS
+        dispatch_bound(
+            dispatcher(local, approval=lambda value: approvals.append(value)),
+            request=admitted("telegram"),
         )
     assert approvals == []
 
     ask = authorization("ask")
     remote = FakePolicy([ask, execution()])
-    result = dispatcher(
-        remote, approval=lambda value: approvals.append(value) or "capability-1"
-    ).dispatch(admitted("telegram"), "browser_open", ARGS)
+    result = dispatch_bound(
+        dispatcher(
+            remote, approval=lambda value: approvals.append(value) or "capability-1"
+        ),
+        request=admitted("telegram"),
+    )
     assert result == {"browser_url_matches": True}
     assert approvals == [ask.result]
     assert remote.calls[1][1]["confirmationCapability"] == "capability-1"
@@ -312,8 +336,8 @@ def test_local_confirm_requires_ui_but_ask_can_approve_remote():
 def test_approval_failure_denies_before_execute(approval_result):
     policy = FakePolicy([authorization("ask")])
     with pytest.raises(ExecutionDenied):
-        dispatcher(policy, approval=lambda _auth: approval_result).dispatch(
-            admitted(), "browser_open", ARGS
+        dispatch_bound(
+            dispatcher(policy, approval=lambda _auth: approval_result),
         )
     assert [method for method, _ in policy.calls] == ["authorize"]
 
@@ -333,7 +357,7 @@ def test_execute_denial_or_malformed_reply_never_calls_adapter(reply):
     browser = ClosedAdapter("browseros")
     policy = FakePolicy([authorization(), reply])
     with pytest.raises(ExecutionDenied):
-        dispatcher(policy, browser=browser).dispatch(admitted(), "browser_open", ARGS)
+        dispatch_bound(dispatcher(policy, browser=browser))
     assert browser.calls == []
 
 
@@ -349,18 +373,18 @@ def test_precondition_failure_denies_before_adapter(monkeypatch, mode):
     monkeypatch.setitem(module.PRECONDITIONS, "browseros_ready", check)
     browser = ClosedAdapter("browseros")
     with pytest.raises(ExecutionDenied):
-        dispatcher(
-            FakePolicy([authorization(), execution()]), browser=browser
-        ).dispatch(admitted(), "browser_open", ARGS)
+        dispatch_bound(
+            dispatcher(FakePolicy([authorization(), execution()]), browser=browser)
+        )
     assert browser.calls == []
 
 
 def test_adapter_exception_is_normalized_to_execution_denied():
     browser = ClosedAdapter("browseros", error=RuntimeError("adapter secret"))
     with pytest.raises(ExecutionDenied) as raised:
-        dispatcher(
-            FakePolicy([authorization(), execution()]), browser=browser
-        ).dispatch(admitted(), "browser_open", ARGS)
+        dispatch_bound(
+            dispatcher(FakePolicy([authorization(), execution()]), browser=browser)
+        )
     assert "adapter secret" not in str(raised.value)
     assert len(browser.calls) == 1
 
@@ -379,7 +403,119 @@ def test_postcondition_failure_records_adapter_once_but_never_succeeds(
     monkeypatch.setitem(module.POSTCONDITIONS, "browser_url_matches", check)
     browser = ClosedAdapter("browseros")
     with pytest.raises(ExecutionDenied):
-        dispatcher(
-            FakePolicy([authorization(), execution()]), browser=browser
-        ).dispatch(admitted(), "browser_open", ARGS)
+        dispatch_bound(
+            dispatcher(FakePolicy([authorization(), execution()]), browser=browser)
+        )
+    assert len(browser.calls) == 1
+
+
+def test_missing_or_mismatched_active_provenance_denies_before_policy():
+    request = admitted()
+    policy = FakePolicy([])
+    tool_dispatcher = dispatcher(policy)
+
+    with pytest.raises(ExecutionDenied):
+        tool_dispatcher.dispatch(request, "browser_open", ARGS)
+    with provenance(
+        DeskPilotProvenance("ui", None, "00000000-0000-0000-0000-000000000000")
+    ):
+        with pytest.raises(ExecutionDenied):
+            tool_dispatcher.dispatch(request, "browser_open", ARGS)
+
+    assert policy.calls == []
+
+
+def test_copied_active_provenance_context_allows_exact_admitted_request():
+    request = admitted()
+    policy = FakePolicy([authorization(), execution()])
+    tool_dispatcher = dispatcher(policy)
+
+    with provenance(request.provenance):
+        observed = copied_context_call(
+            lambda: tool_dispatcher.dispatch(request, "browser_open", ARGS)
+        )
+
+    assert observed == {"browser_url_matches": True}
+
+
+def test_concurrent_copied_provenance_contexts_dispatch_only_their_admission():
+    barrier = Barrier(2)
+    sessions = []
+    for index in (1, 2):
+        request = AdmittedRequest(
+            DeskPilotProvenance("ui", None, f"00000000-0000-0000-0000-{index:012d}"),
+            f"10000000-0000-0000-0000-{index:012d}",
+        )
+        policy = FakePolicy([authorization(), execution()])
+        tool_dispatcher = dispatcher(policy)
+        with provenance(request.provenance):
+            context = copy_context()
+
+        def run(bound_dispatcher=tool_dispatcher, bound_request=request):
+            barrier.wait()
+            return bound_dispatcher.dispatch(bound_request, "browser_open", ARGS)
+
+        sessions.append((context, run, request, policy))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(context.run, run) for context, run, *_ in sessions]
+        observed = [future.result() for future in futures]
+
+    assert observed == [
+        {"browser_url_matches": True},
+        {"browser_url_matches": True},
+    ]
+    for _, _, request, policy in sessions:
+        assert policy.calls[0][1]["admissionID"] == request.admission_id
+        assert policy.calls[0][1]["traceID"] == request.provenance.trace_id
+
+
+@pytest.mark.parametrize("risk", ["observe", "mutation", "sensitive", "prohibited"])
+def test_authorization_risk_must_match_registry_bound_action(risk):
+    reply = authorization("ask")
+    reply.result["decision"]["risk"] = risk
+    approvals = []
+    browser = ClosedAdapter("browseros")
+    policy = FakePolicy([reply])
+
+    with pytest.raises(ExecutionDenied):
+        dispatch_bound(
+            dispatcher(
+                policy,
+                browser=browser,
+                approval=lambda value: approvals.append(value) or "capability-1",
+            )
+        )
+
+    assert [method for method, _ in policy.calls] == ["authorize"]
+    assert approvals == []
+    assert browser.calls == []
+
+
+def test_adapter_observations_are_detached_before_postcondition_and_return():
+    retained = {"browser_url_matches": True, "nested": {"value": 1}}
+    browser = ClosedAdapter("browseros", result=retained)
+
+    observed = dispatch_bound(
+        dispatcher(FakePolicy([authorization(), execution()]), browser=browser)
+    )
+    retained["nested"]["value"] = 99
+    retained["browser_url_matches"] = False
+
+    assert observed == {"browser_url_matches": True, "nested": {"value": 1}}
+    assert observed is not retained
+    assert observed["nested"] is not retained["nested"]
+
+
+@pytest.mark.parametrize(
+    "observed", [None, [], "ok", {"browser_url_matches": True, "value": float("nan")}]
+)
+def test_malformed_nonobject_or_nonfinite_adapter_observations_are_denied(observed):
+    browser = ClosedAdapter("browseros", result=observed)
+
+    with pytest.raises(ExecutionDenied):
+        dispatch_bound(
+            dispatcher(FakePolicy([authorization(), execution()]), browser=browser)
+        )
+
     assert len(browser.calls) == 1

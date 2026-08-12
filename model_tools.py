@@ -873,6 +873,22 @@ def _emit_post_tool_call_hook(
         logger.debug("post_tool_call hook error: %s", _hook_err)
 
 
+def _deskpilot_policy_denied(reason: str) -> str:
+    return json.dumps(
+        {
+            "ok": False,
+            "error": "deskpilot.policy_denied",
+            "_meta": {
+                "deskpilot": {
+                    "ruleID": "execute.denied",
+                    "reason": reason,
+                }
+            },
+        },
+        separators=(",", ":"),
+    )
+
+
 def _handle_function_call_unchecked(
     function_name: str,
     function_args: Dict[str, Any],
@@ -913,6 +929,8 @@ def _handle_function_call_unchecked(
     Returns:
         Function result as a JSON string.
     """
+    if os.environ.get("DESKPILOT_MODE") == "1":
+        return _deskpilot_policy_denied("PermissionError")
     # Coerce string arguments to their schema-declared types (e.g. "42"→42)
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
@@ -1254,19 +1272,7 @@ def handle_function_call(
             allow_nan=False,
         )
     except Exception as exc:
-        return json.dumps(
-            {
-                "ok": False,
-                "error": "deskpilot.policy_denied",
-                "_meta": {
-                    "deskpilot": {
-                        "ruleID": "execute.denied",
-                        "reason": type(exc).__name__,
-                    }
-                },
-            },
-            separators=(",", ":"),
-        )
+        return _deskpilot_policy_denied(type(exc).__name__)
 
 
 # =============================================================================
