@@ -15,8 +15,8 @@ from deskpilot_hermes.policy import ParentPolicyClient, PolicyReply
 MAX_FRAME = 262_144
 PENDING_ID = "74e96407-e06c-4784-825f-36315b0be447"
 ROUTE_ID = "116771cc-df21-437a-b28d-5944a42c1a45"
-SESSION_ID = "3616552d-1ab5-4565-822f-63fcedb82cab"
-PERMISSION_ID = "b1d75631-5f89-4f4d-a8b0-2b8501bc9a1f"
+SESSION_ID = "session-1"
+PERMISSION_ID = "permission-1"
 EVENT_ID = "6d6fe658-0bd7-4086-9569-7e344cb3d285"
 CONSUMPTION_ID = "d10f4f35-18b8-48e9-a146-4e70f82ea19b"
 
@@ -473,7 +473,7 @@ def test_approval_mismatch_denial_disconnect_and_bad_ack_return_none(tmp_path, m
 
 @pytest.mark.parametrize(
     "field",
-    ["pendingApprovalID", "routeID", "sessionID", "permissionRequestID"],
+    ["pendingApprovalID", "routeID"],
 )
 @pytest.mark.parametrize("kind", ["malformed", "noncanonical"])
 def test_approval_rejects_invalid_input_correlation_uuid_before_connect(
@@ -493,6 +493,41 @@ def test_approval_rejects_invalid_input_correlation_uuid_before_connect(
     assert client.subscribe_approval(*values.values()) is None
 
 
+@pytest.mark.parametrize("field", ["sessionID", "permissionRequestID"])
+@pytest.mark.parametrize("invalid", ["", None, 7])
+def test_approval_rejects_invalid_opaque_correlation_before_connect(
+    monkeypatch, field, invalid
+):
+    values = {
+        "pendingApprovalID": PENDING_ID,
+        "routeID": ROUTE_ID,
+        "sessionID": SESSION_ID,
+        "permissionRequestID": PERMISSION_ID,
+    }
+    values[field] = invalid
+    client = ParentPolicyClient("/private/tmp/policy.sock")
+    monkeypatch.setattr(
+        client, "_connect", lambda: pytest.fail("invalid value must not connect")
+    )
+    assert client.subscribe_approval(*values.values()) is None
+
+
+def test_approval_accepts_opaque_nonempty_session_and_permission_ids(monkeypatch):
+    attempts = []
+    client = ParentPolicyClient("/private/tmp/policy.sock")
+
+    def unavailable():
+        attempts.append(True)
+        raise OSError("transport unavailable")
+
+    monkeypatch.setattr(client, "_connect", unavailable)
+    assert (
+        client.subscribe_approval(PENDING_ID, ROUTE_ID, "session-1", "permission-1")
+        is None
+    )
+    assert attempts == [True]
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -500,11 +535,25 @@ def test_approval_rejects_invalid_input_correlation_uuid_before_connect(
         ("eventID", EVENT_ID.upper()),
         ("pendingApprovalID", PENDING_ID.upper()),
         ("routeID", ROUTE_ID.upper()),
-        ("sessionID", SESSION_ID.upper()),
-        ("permissionRequestID", PERMISSION_ID.upper()),
     ],
 )
 def test_approval_rejects_malformed_or_noncanonical_event_uuid(tmp_path, field, value):
+    def handler(request, connection):
+        send_frame(connection, approval_ack(request))
+        send_frame(connection, approval_event(request, **{field: value}))
+
+    with unix_server(tmp_path, handler) as path:
+        event = ParentPolicyClient(path).subscribe_approval(
+            PENDING_ID, ROUTE_ID, SESSION_ID, PERMISSION_ID
+        )
+    assert event is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("sessionID", "other-session"), ("permissionRequestID", "other-permission")],
+)
+def test_approval_rejects_exact_opaque_correlation_mismatch(tmp_path, field, value):
     def handler(request, connection):
         send_frame(connection, approval_ack(request))
         send_frame(connection, approval_event(request, **{field: value}))

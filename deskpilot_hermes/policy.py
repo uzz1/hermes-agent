@@ -211,8 +211,10 @@ class ParentPolicyClient:
         if self._socket_path() is None:
             return None
         try:
-            for value in (pending_id, route_id, session_id, permission_id):
+            for value in (pending_id, route_id):
                 validate_uuid(value)
+            if not nonempty_string(session_id) or not nonempty_string(permission_id):
+                raise ValueError("opaque correlation IDs must be nonempty strings")
         except (TypeError, ValueError):
             return None
         request_id = str(uuid4())
@@ -282,10 +284,12 @@ class ParentPolicyClient:
             for field in (
                 "pendingApprovalID",
                 "routeID",
-                "sessionID",
-                "permissionRequestID",
             ):
                 validate_uuid(event.get(field))
+            if not nonempty_string(event.get("sessionID")) or not nonempty_string(
+                event.get("permissionRequestID")
+            ):
+                return None
             actual = (
                 event.get("pendingApprovalID"),
                 event.get("routeID"),
