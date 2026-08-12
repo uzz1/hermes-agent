@@ -1,6 +1,7 @@
 import copy
 import builtins
 import importlib
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -146,9 +147,9 @@ def test_tool_search_cannot_collapse_or_add_bridges(monkeypatch):
     assert set(functions).isdisjoint({"tool_search", "tool_describe", "tool_call"})
 
 
-@pytest.mark.parametrize("duplicate_first", [True, False])
-def test_exact_deskpilot_surface_cache_does_not_alias_duplicate_list(
-    monkeypatch, duplicate_first
+@pytest.mark.parametrize("invalid_first", [True, False])
+def test_exact_deskpilot_surface_cache_does_not_bypass_duplicate_rejection(
+    monkeypatch, invalid_first
 ):
     monkeypatch.setenv("DESKPILOT_MODE", "1")
     monkeypatch.setattr(
@@ -170,19 +171,25 @@ def test_exact_deskpilot_surface_cache_does_not_alias_duplicate_list(
         {"platform_toolsets": {"cli": ["deskpilot", "no_mcp"]}},
         "cli",
     )
-    lists = [["deskpilot", "deskpilot"], exact_toolsets]
-    if not duplicate_first:
-        lists.reverse()
-    observed = {}
-    for enabled_toolsets in lists:
-        definitions = model_tools.get_tool_definitions(
-            enabled_toolsets=enabled_toolsets,
-            quiet_mode=True,
-        )
-        observed[type(enabled_toolsets)] = set(_functions(definitions))
+    selections = [["deskpilot", "deskpilot"], exact_toolsets]
+    if not invalid_first:
+        selections.reverse()
+    exact_names = None
+    for enabled_toolsets in selections:
+        if type(enabled_toolsets) is list:
+            with pytest.raises(RuntimeError):
+                model_tools.get_tool_definitions(
+                    enabled_toolsets=enabled_toolsets,
+                    quiet_mode=True,
+                )
+        else:
+            definitions = model_tools.get_tool_definitions(
+                enabled_toolsets=enabled_toolsets,
+                quiet_mode=True,
+            )
+            exact_names = set(_functions(definitions))
 
-    assert observed[set] == DESKPILOT_NAMES
-    assert observed[list] == {"tool_search", "tool_describe", "tool_call"}
+    assert exact_names == DESKPILOT_NAMES
 
 
 @pytest.mark.parametrize("selection_kind", ["literal_list", "platform_set"])
@@ -236,30 +243,6 @@ def test_ordinary_kanban_worker_still_expands_restricted_toolsets(monkeypatch):
         _functions(
             model_tools.get_tool_definitions(
                 enabled_toolsets=["terminal"],
-                quiet_mode=True,
-                skip_tool_search_assembly=True,
-            )
-        )
-    )
-
-    assert {"kanban_show", "kanban_complete", "kanban_block"}.issubset(names)
-
-
-@pytest.mark.parametrize(
-    "enabled_toolsets",
-    [["deskpilot", "deskpilot"], ["deskpilot", "terminal"]],
-)
-def test_nonexact_deskpilot_selection_does_not_suppress_kanban(
-    monkeypatch, enabled_toolsets
-):
-    monkeypatch.setenv("DESKPILOT_MODE", "1")
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_nonexact")
-    _reset_definition_caches()
-
-    names = set(
-        _functions(
-            model_tools.get_tool_definitions(
-                enabled_toolsets=enabled_toolsets,
                 quiet_mode=True,
                 skip_tool_search_assembly=True,
             )
@@ -408,3 +391,269 @@ def test_deskpilot_mode_does_not_change_other_platform_resolution(monkeypatch):
     monkeypatch.setenv("DESKPILOT_MODE", "1")
     assert tools_config._get_platform_tools(config, "discord") == ordinary
     assert "web" in ordinary
+
+
+@pytest.mark.parametrize(
+    ("enabled_toolsets", "disabled_toolsets"),
+    [
+        (None, None),
+        (["hermes-acp"], None),
+        (["deskpilot", "terminal"], None),
+        (["deskpilot", "mcp-browseros"], None),
+        (["deskpilot", "deskpilot"], None),
+        ((name for name in ["deskpilot"]), None),
+        ("deskpilot", None),
+        (["deskpilot"], ["terminal"]),
+    ],
+)
+@pytest.mark.parametrize(
+    "definition_fn_name", ["get_tool_definitions", "_compute_tool_definitions"]
+)
+def test_central_model_boundary_rejects_nonexact_deskpilot_selection_before_expansion(
+    monkeypatch, enabled_toolsets, disabled_toolsets, definition_fn_name
+):
+    monkeypatch.setenv("DESKPILOT_MODE", "1")
+    monkeypatch.setattr(
+        model_tools.registry,
+        "get_definitions",
+        lambda *_args, **_kwargs: pytest.fail("registry assembly was touched"),
+    )
+    monkeypatch.setattr(
+        "toolsets.get_all_toolsets",
+        lambda: pytest.fail("default toolset expansion was touched"),
+    )
+    monkeypatch.setattr(
+        model_tools,
+        "validate_toolset",
+        lambda _name: pytest.fail("toolset validation was touched"),
+    )
+    definition_fn = getattr(model_tools, definition_fn_name)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"^DeskPilot tool definitions require exactly \[deskpilot\] and no disabled toolsets$",
+    ):
+        definition_fn(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "enabled_toolsets",
+    [["deskpilot"], ("deskpilot",), {"deskpilot"}],
+)
+@pytest.mark.parametrize("disabled_toolsets", [None, [], (), set()])
+def test_central_model_boundary_accepts_supported_exact_selection_only(
+    monkeypatch, enabled_toolsets, disabled_toolsets
+):
+    monkeypatch.setenv("DESKPILOT_MODE", "1")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_closed")
+    _reset_definition_caches()
+
+    names = set(
+        _functions(
+            model_tools.get_tool_definitions(
+                enabled_toolsets=enabled_toolsets,
+                disabled_toolsets=disabled_toolsets,
+                quiet_mode=True,
+            )
+        )
+    )
+
+    assert names == DESKPILOT_NAMES
+    assert names.isdisjoint({
+        "memory",
+        "todo",
+        "delegate_task",
+        "tool_search",
+        "tool_describe",
+        "tool_call",
+    })
+    assert not any(name.startswith("kanban_") for name in names)
+
+
+@pytest.mark.parametrize(
+    "definition_fn_name", ["get_tool_definitions", "_compute_tool_definitions"]
+)
+def test_central_model_boundary_rejects_nonempty_falsey_disabled_container(
+    monkeypatch, definition_fn_name
+):
+    class FalseyDisabled(list):
+        def __bool__(self):
+            return False
+
+    monkeypatch.setenv("DESKPILOT_MODE", "1")
+    definition_fn = getattr(model_tools, definition_fn_name)
+
+    with pytest.raises(RuntimeError):
+        definition_fn(
+            enabled_toolsets=["deskpilot"],
+            disabled_toolsets=FalseyDisabled(["terminal"]),
+            quiet_mode=True,
+        )
+
+
+def test_ordinary_mode_keeps_default_and_nonexact_behavior(monkeypatch):
+    monkeypatch.delenv("DESKPILOT_MODE", raising=False)
+    _reset_definition_caches()
+
+    assert isinstance(
+        model_tools.get_tool_definitions(quiet_mode=True),
+        list,
+    )
+    assert isinstance(
+        model_tools.get_tool_definitions(
+            enabled_toolsets=["terminal", "file"],
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        ),
+        list,
+    )
+
+
+def test_warm_ordinary_cache_cannot_bypass_deskpilot_rejection(monkeypatch):
+    monkeypatch.delenv("DESKPILOT_MODE", raising=False)
+    _reset_definition_caches()
+    model_tools.get_tool_definitions(
+        enabled_toolsets=["terminal"],
+        quiet_mode=True,
+    )
+
+    monkeypatch.setenv("DESKPILOT_MODE", "1")
+    with pytest.raises(RuntimeError):
+        model_tools.get_tool_definitions(
+            enabled_toolsets=["terminal"],
+            quiet_mode=True,
+        )
+
+
+@pytest.mark.parametrize("registry_drift", ["extra", "missing", "duplicate"])
+def test_central_model_boundary_rejects_deskpilot_definition_drift(
+    monkeypatch, registry_drift
+):
+    monkeypatch.setenv("DESKPILOT_MODE", "1")
+    _reset_definition_caches()
+    extra_name = "unexpected_deskpilot_tool"
+
+    if registry_drift == "extra":
+        registry.register(
+            name=extra_name,
+            toolset="deskpilot",
+            schema={
+                "name": extra_name,
+                "description": "must never be exposed",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=lambda *_args, **_kwargs: "{}",
+        )
+    else:
+        original_get_definitions = registry.get_definitions
+
+        def drift_definitions(*args, **kwargs):
+            definitions = original_get_definitions(*args, **kwargs)
+            if registry_drift == "missing":
+                return definitions[1:]
+            return [*definitions, definitions[0]]
+
+        monkeypatch.setattr(registry, "get_definitions", drift_definitions)
+
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="^DeskPilot tool definitions do not match authorized actions$",
+        ):
+            model_tools.get_tool_definitions(
+                enabled_toolsets=["deskpilot"],
+                quiet_mode=True,
+            )
+    finally:
+        if registry_drift == "extra":
+            registry.deregister(extra_name)
+        _reset_definition_caches()
+
+
+def test_deskpilot_definition_cache_is_detached_and_revalidated(monkeypatch):
+    monkeypatch.setenv("DESKPILOT_MODE", "1")
+    _reset_definition_caches()
+
+    first = model_tools.get_tool_definitions(
+        enabled_toolsets=["deskpilot"],
+        quiet_mode=True,
+    )
+    first[0]["function"]["name"] = "terminal"
+    first[0]["function"]["parameters"]["poisoned"] = True
+
+    second = model_tools.get_tool_definitions(
+        enabled_toolsets=["deskpilot"],
+        quiet_mode=True,
+    )
+    names = set(_functions(second))
+
+    assert names == DESKPILOT_NAMES
+    assert "terminal" not in names
+    assert all(
+        "poisoned" not in definition["function"]["parameters"] for definition in second
+    )
+
+
+def test_actual_acp_agent_selection_fails_closed_at_model_boundary(monkeypatch):
+    from acp_adapter import session as acp_session
+
+    captured = {}
+
+    class CapturingAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setenv("DESKPILOT_MODE", "1")
+    monkeypatch.setattr("run_agent.AIAgent", CapturingAgent)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider", lambda **_kwargs: {}
+    )
+    monkeypatch.setattr(acp_session, "_register_task_cwd", lambda *_args: None)
+    manager = acp_session.SessionManager(db=MagicMock())
+
+    manager._make_agent(session_id="acp-session", cwd="/tmp")
+
+    assert captured["enabled_toolsets"] == ["hermes-acp"]
+    with pytest.raises(RuntimeError):
+        model_tools.get_tool_definitions(
+            enabled_toolsets=captured["enabled_toolsets"],
+            quiet_mode=True,
+        )
+
+
+def test_actual_cron_fallback_and_per_job_override_fail_closed(monkeypatch):
+    from cron.scheduler import _resolve_cron_enabled_toolsets
+
+    monkeypatch.setenv("DESKPILOT_MODE", "1")
+    missing_config = _resolve_cron_enabled_toolsets({}, {})
+    per_job_override = _resolve_cron_enabled_toolsets(
+        {"enabled_toolsets": ["terminal"]}, {}
+    )
+
+    assert missing_config is None
+    assert per_job_override == ["terminal"]
+    for enabled_toolsets in (missing_config, per_job_override):
+        with pytest.raises(RuntimeError):
+            model_tools.get_tool_definitions(
+                enabled_toolsets=enabled_toolsets,
+                quiet_mode=True,
+            )
+
+
+def test_oneshot_native_selection_fails_closed_at_model_boundary(monkeypatch):
+    from hermes_cli.oneshot import _normalize_toolsets
+
+    monkeypatch.setenv("DESKPILOT_MODE", "1")
+    enabled_toolsets = _normalize_toolsets("terminal,file")
+
+    assert enabled_toolsets == ["terminal", "file"]
+    with pytest.raises(RuntimeError):
+        model_tools.get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            quiet_mode=True,
+        )

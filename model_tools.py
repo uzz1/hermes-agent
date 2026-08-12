@@ -24,6 +24,7 @@ import os
 import json
 import re
 import asyncio
+import copy
 import logging
 import threading
 import time
@@ -260,12 +261,40 @@ _tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
 # set (the handful of distinct platform/toolset combos a gateway actually
 # serves) while keeping the cap small. (#19251)
 _TOOL_DEFS_CACHE_MAX = 8
+_DESKPILOT_SELECTION_ERROR = (
+    "DeskPilot tool definitions require exactly [deskpilot] and no disabled toolsets"
+)
+_DESKPILOT_DEFINITION_ERROR = (
+    "DeskPilot tool definitions do not match authorized actions"
+)
 
 
-def _is_closed_deskpilot_surface(enabled_toolsets: object) -> bool:
-    if os.environ.get("DESKPILOT_MODE") != "1" or enabled_toolsets is None:
+def _validate_deskpilot_tool_selection(
+    enabled_toolsets: object,
+    disabled_toolsets: object,
+) -> bool:
+    """Validate the closed DeskPilot model surface before any tool expansion."""
+    if os.environ.get("DESKPILOT_MODE") != "1":
         return False
-    return list(enabled_toolsets) == ["deskpilot"]
+    if disabled_toolsets is not None and (
+        type(disabled_toolsets) not in {list, tuple, set}
+        or len(disabled_toolsets) != 0
+    ):
+        raise RuntimeError(_DESKPILOT_SELECTION_ERROR)
+    if type(enabled_toolsets) not in {list, tuple, set}:
+        raise RuntimeError(_DESKPILOT_SELECTION_ERROR)
+    if len(enabled_toolsets) != 1 or next(iter(enabled_toolsets)) != "deskpilot":
+        raise RuntimeError(_DESKPILOT_SELECTION_ERROR)
+    return True
+
+
+def _validate_deskpilot_definition_names(definitions: List[Dict[str, Any]]) -> None:
+    """Require the model-visible DeskPilot names to match its authorized actions."""
+    from deskpilot_hermes.integration import TOOL_ACTIONS
+
+    names = {definition.get("function", {}).get("name") for definition in definitions}
+    if names != set(TOOL_ACTIONS) or len(definitions) != len(TOOL_ACTIONS):
+        raise RuntimeError(_DESKPILOT_DEFINITION_ERROR)
 
 
 def _clear_tool_defs_cache() -> None:
@@ -299,6 +328,9 @@ def get_tool_definitions(
     Returns:
         Filtered list of OpenAI-format tool definitions.
     """
+    deskpilot_closed_surface = _validate_deskpilot_tool_selection(
+        enabled_toolsets, disabled_toolsets
+    )
     # Fast path: memoized result when the caller doesn't need stdout prints.
     # The cache key captures every argument-level input; the registry
     # generation captures registry mutations (MCP refresh, plugin load).
@@ -322,17 +354,21 @@ def get_tool_definitions(
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             os.environ.get("DESKPILOT_MODE"),
-            _is_closed_deskpilot_surface(enabled_toolsets),
+            deskpilot_closed_surface,
             bool(skip_tool_search_assembly),
         )
         cached = _tool_defs_cache.get(cache_key)
         if cached is not None:
+            if deskpilot_closed_surface:
+                _validate_deskpilot_definition_names(cached)
             # Update _last_resolved_tool_names so downstream callers see
             # consistent state even on a cache hit.
             global _last_resolved_tool_names
             _last_resolved_tool_names = [t["function"]["name"] for t in cached]
             # Return a shallow copy of the list but share the dict references —
             # schemas are treated as read-only by all known callers.
+            if deskpilot_closed_surface:
+                return copy.deepcopy(cached)
             return list(cached)
 
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
@@ -350,7 +386,11 @@ def get_tool_definitions(
         # toolset/config fingerprints it sees over its lifetime (#19251).
         if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
             _tool_defs_cache.pop(next(iter(_tool_defs_cache)))  # evict oldest
-        _tool_defs_cache[cache_key] = result
+        _tool_defs_cache[cache_key] = (
+            copy.deepcopy(result) if deskpilot_closed_surface else result
+        )
+        if deskpilot_closed_surface:
+            return copy.deepcopy(result)
         return list(result)
     return result
 
@@ -362,15 +402,14 @@ def _compute_tool_definitions(
     skip_tool_search_assembly: bool = False,
 ) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
+    deskpilot_closed_surface = _validate_deskpilot_tool_selection(
+        enabled_toolsets, disabled_toolsets
+    )
     # Determine which tool names the caller wants
     tools_to_include: set = set()
-    deskpilot_closed_surface = False
 
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
-        deskpilot_closed_surface = _is_closed_deskpilot_surface(
-            effective_enabled_toolsets
-        )
         if (
             os.environ.get("HERMES_KANBAN_TASK")
             and not deskpilot_closed_surface
@@ -428,6 +467,8 @@ def _compute_tool_definitions(
 
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+    if deskpilot_closed_surface:
+        _validate_deskpilot_definition_names(filtered_tools)
 
     # The set of tool names that actually passed check_fn filtering.
     # Use this (not tools_to_include) for any downstream schema that references
