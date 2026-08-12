@@ -109,6 +109,26 @@ def test_call_accepts_correlated_error(tmp_path):
     assert reply == PolicyReply(None, "admit.denied", "not allowed")
 
 
+def test_call_rejects_extra_nested_error_fields(tmp_path):
+    def handler(request, connection):
+        send_frame(
+            connection,
+            response_for(
+                request,
+                error={
+                    "ruleID": "admit.denied",
+                    "reason": "not allowed",
+                    "extra": True,
+                },
+            ),
+        )
+
+    with unix_server(tmp_path, handler) as path:
+        reply = ParentPolicyClient(path).call("admit", {})
+
+    assert reply.result is None and reply.rule_id == "policy.transport_denied"
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -212,6 +232,42 @@ def test_approval_subscribe_sends_exact_correlation_and_returns_only_approve(tmp
     }
     assert event["resolution"] == "approve"
     assert event["confirmationCapability"] == "local-capability"
+
+
+def test_approval_subscribe_rejects_extra_acknowledgement_result_fields(tmp_path):
+    def handler(request, connection):
+        acknowledgement = approval_ack(request)
+        acknowledgement["result"]["extra"] = True
+        send_frame(connection, acknowledgement)
+        send_frame(connection, approval_event(request))
+
+    with unix_server(tmp_path, handler) as path:
+        event = ParentPolicyClient(path).subscribe_approval(
+            "pending-1", "route-1", "session-1", "permission-1"
+        )
+
+    assert event is None
+
+
+@pytest.mark.parametrize("expiry", ["past", "distant", "naive"])
+def test_approval_subscribe_rejects_invalid_expiry_bounds(tmp_path, expiry):
+    def handler(request, connection):
+        acknowledgement = approval_ack(request)
+        if expiry == "naive":
+            expires_at = datetime.now() + timedelta(seconds=30)
+        else:
+            offset = -1 if expiry == "past" else 600
+            expires_at = datetime.now(UTC) + timedelta(seconds=offset)
+        acknowledgement["result"]["expiresAt"] = expires_at.isoformat()
+        send_frame(connection, acknowledgement)
+        send_frame(connection, approval_event(request))
+
+    with unix_server(tmp_path, handler) as path:
+        event = ParentPolicyClient(path).subscribe_approval(
+            "pending-1", "route-1", "session-1", "permission-1"
+        )
+
+    assert event is None
 
 
 @pytest.mark.parametrize(

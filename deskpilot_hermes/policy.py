@@ -69,6 +69,8 @@ def _validate_response(
         raise ValueError("result must be an object")
     if error is not None and not isinstance(error, dict):
         raise ValueError("error must be an object")
+    if error is not None and set(error) != {"ruleID", "reason"}:
+        raise ValueError("error must be a closed object")
     return result, error
 
 
@@ -150,6 +152,12 @@ class ParentPolicyClient:
                     result, error = _validate_response(acknowledgement, request_id)
                     if error is not None or result is None:
                         return None
+                    if set(result) != {
+                        "subscribed",
+                        "pendingApprovalID",
+                        "expiresAt",
+                    }:
+                        return None
                     if result.get("subscribed") is not True:
                         return None
                     if result.get("pendingApprovalID") != pending_id:
@@ -160,8 +168,10 @@ class ParentPolicyClient:
                     expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
                     if expires.tzinfo is None:
                         raise ValueError("expiry must include timezone")
-                    remaining = max(0.0, (expires - datetime.now(UTC)).total_seconds())
-                    peer.settimeout(min(300.0, remaining) + 2.0)
+                    remaining = (expires - datetime.now(UTC)).total_seconds()
+                    if remaining <= 0.0 or remaining > 300.0:
+                        return None
+                    peer.settimeout(remaining + 2.0)
                     frame = _read_stream_frame(stream)
 
             if set(frame) != {"protocol", "version", "event"}:

@@ -1,5 +1,6 @@
 import hashlib
 import json
+from copy import deepcopy
 
 import pytest
 
@@ -13,6 +14,9 @@ from deskpilot_hermes.integration import (
 )
 from deskpilot_hermes.policy import PolicyReply
 from deskpilot_hermes.provenance import DeskPilotProvenance, provenance
+
+
+PENDING_ID = "74e96407-e06c-4784-825f-36315b0be447"
 
 
 class FakePolicy:
@@ -33,8 +37,30 @@ def admitted_reply(admission_id="admission-1"):
 
 def authorization(verdict="allow", **extra):
     result = {
-        "decision": {"verdict": verdict, "ruleID": "decision.rule", "reason": "reason"},
-        "actionDigest": "sha256:digest",
+        "decision": {
+            "risk": "mutation",
+            "verdict": verdict,
+            "ruleID": "decision.rule",
+            "reason": "reason",
+        },
+        "actionDigest": None if verdict == "deny" else "sha256:digest",
+        "pendingApprovalID": PENDING_ID
+        if verdict in {"ask", "local_confirm"}
+        else None,
+        "expiresAt": "2099-08-12T12:00:00Z"
+        if verdict in {"ask", "local_confirm"}
+        else None,
+    }
+    result.update(extra)
+    return PolicyReply(result, "policy.ok", "ok")
+
+
+def execution(execute=True, **extra):
+    result = {
+        "execute": execute,
+        "consumptionID": "consumption-1" if execute else None,
+        "ruleID": "execute.allowed" if execute else "execute.denied",
+        "reason": "executed" if execute else "denied",
     }
     result.update(extra)
     return PolicyReply(result, "policy.ok", "ok")
@@ -283,13 +309,29 @@ def test_malformed_scheduler_policy_reply_fails_closed():
     )
 
 
+@pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), float("-inf")])
+def test_scheduler_rejects_nonfinite_json_before_policy_call(nonfinite):
+    inputs = {"value": nonfinite}
+    permissive = json.dumps(inputs, sort_keys=True, separators=(",", ":")).encode()
+    policy = FakePolicy([])
+    admitted = admit_scheduled(
+        policy,
+        {
+            "jobID": "job",
+            "actionID": "health.observe",
+            "actionVersion": 1,
+            "inputDigest": "sha256:" + hashlib.sha256(permissive).hexdigest(),
+            "inputs": inputs,
+        },
+    )
+    assert admitted is None
+    assert policy.calls == []
+
+
 def test_guarded_allow_authorizes_executes_then_invokes_once():
     prov = DeskPilotProvenance("ui", None, "trace-1")
     admitted = AdmittedRequest(prov, "admission-1")
-    policy = FakePolicy([
-        authorization(),
-        PolicyReply({"execute": True}, "policy.ok", "ok"),
-    ])
+    policy = FakePolicy([authorization(), execution()])
     invoked = []
 
     with provenance(prov):
@@ -355,6 +397,66 @@ def test_transport_or_malformed_authorization_never_invokes(reply):
     assert value is None and denied.result is None and invoked == []
 
 
+def _malformed_authorizations():
+    cases = []
+
+    def changed(verdict="allow", **updates):
+        value = deepcopy(authorization(verdict).result)
+        value.update(updates)
+        return PolicyReply(value, "policy.ok", "ok")
+
+    cases.append(changed(extra=True))
+    value = deepcopy(authorization().result)
+    value["decision"]["extra"] = True
+    cases.append(PolicyReply(value, "policy.ok", "ok"))
+    for field, invalid in (
+        ("risk", "unknown"),
+        ("verdict", "unknown"),
+        ("ruleID", ""),
+        ("reason", ""),
+    ):
+        value = deepcopy(authorization().result)
+        value["decision"][field] = invalid
+        cases.append(PolicyReply(value, "policy.ok", "ok"))
+    cases.extend([
+        changed(pendingApprovalID=PENDING_ID),
+        changed(expiresAt="2099-08-12T12:00:00Z"),
+        changed(actionDigest=None),
+        changed("ask", pendingApprovalID="not-a-uuid"),
+        changed("ask", expiresAt="not-rfc3339"),
+        changed("ask", expiresAt="2099-08-12T12:00:00"),
+        changed("ask", pendingApprovalID=None),
+        changed("ask", expiresAt=None),
+        changed("deny", actionDigest="sha256:digest"),
+        changed("deny", pendingApprovalID=PENDING_ID),
+        changed("deny", expiresAt="2099-08-12T12:00:00Z"),
+    ])
+    return cases
+
+
+@pytest.mark.parametrize("reply", _malformed_authorizations())
+def test_closed_authorization_contract_denies_malformed_shapes_before_callback_or_invoke(
+    reply,
+):
+    prov = DeskPilotProvenance("ui", None, "trace-1")
+    callbacks = []
+    invoked = []
+    policy = FakePolicy([reply])
+    with provenance(prov):
+        value, denied = guarded_tool_call(
+            policy,
+            AdmittedRequest(prov, "a"),
+            "cua_click",
+            {},
+            lambda: invoked.append(True),
+            lambda result: callbacks.append(result) or "capability",
+        )
+    assert value is None
+    assert denied.rule_id == "policy.malformed_reply"
+    assert callbacks == [] and invoked == []
+    assert [method for method, _ in policy.calls] == ["authorize"]
+
+
 def test_deny_uses_policy_decision_and_never_invokes():
     prov = DeskPilotProvenance("ui", None, "trace-1")
     invoked = []
@@ -376,12 +478,12 @@ def test_deny_uses_policy_decision_and_never_invokes():
 
 @pytest.mark.parametrize("verdict", ["ask", "local_confirm"])
 def test_local_confirmation_failure_and_remote_response_never_invoke(verdict):
-    prov = DeskPilotProvenance("telegram", "telegram:42", "trace-1")
-    auth = authorization(
-        verdict,
-        pendingApprovalID="pending-1",
-        confirmationCapability="remote-must-not-count",
+    prov = (
+        DeskPilotProvenance("ui", None, "trace-1")
+        if verdict == "local_confirm"
+        else DeskPilotProvenance("telegram", "telegram:42", "trace-1")
     )
+    auth = authorization(verdict)
     callbacks = []
     invoked = []
     with provenance(prov):
@@ -391,7 +493,9 @@ def test_local_confirmation_failure_and_remote_response_never_invoke(verdict):
             "cua_click",
             {},
             lambda: invoked.append(True),
-            lambda result: callbacks.append(result),
+            lambda result: (
+                callbacks.append(result) or result.get("confirmationCapability")
+            ),
         )
     assert value is None and reply.rule_id == "policy.approval_denied"
     assert callbacks == [auth.result]
@@ -400,10 +504,14 @@ def test_local_confirmation_failure_and_remote_response_never_invoke(verdict):
 
 @pytest.mark.parametrize("verdict", ["ask", "local_confirm"])
 def test_ask_resumes_only_with_nonempty_supplied_local_capability(verdict):
-    prov = DeskPilotProvenance("telegram", "telegram:42", "trace-1")
+    prov = (
+        DeskPilotProvenance("ui", None, "trace-1")
+        if verdict == "local_confirm"
+        else DeskPilotProvenance("telegram", "telegram:42", "trace-1")
+    )
     policy = FakePolicy([
-        authorization(verdict, pendingApprovalID="pending-1"),
-        PolicyReply({"execute": True}, "policy.ok", "ok"),
+        authorization(verdict),
+        execution(),
     ])
     invoked = []
     with provenance(prov):
@@ -417,6 +525,32 @@ def test_ask_resumes_only_with_nonempty_supplied_local_capability(verdict):
         )
     assert value == "done" and invoked == [True]
     assert policy.calls[1][1]["confirmationCapability"] == "local-capability"
+
+
+@pytest.mark.parametrize(
+    "prov",
+    [
+        DeskPilotProvenance("telegram", "telegram:42", "trace-1"),
+        DeskPilotProvenance("signal", "signal:+27820000000", "trace-1"),
+        DeskPilotProvenance("scheduler", "job:health", "trace-1"),
+    ],
+)
+def test_local_confirm_is_denied_outside_ui_before_callback_or_execute(prov):
+    callbacks = []
+    invoked = []
+    policy = FakePolicy([authorization("local_confirm")])
+    with provenance(prov):
+        value, reply = guarded_tool_call(
+            policy,
+            AdmittedRequest(prov, "a"),
+            "cua_click",
+            {},
+            lambda: invoked.append(True),
+            lambda result: callbacks.append(result) or "local-capability",
+        )
+    assert value is None and reply.rule_id == "policy.approval_denied"
+    assert callbacks == [] and invoked == []
+    assert [method for method, _ in policy.calls] == ["authorize"]
 
 
 @pytest.mark.parametrize("capability", [None, "", 7])
@@ -441,7 +575,7 @@ def test_missing_or_invalid_local_capability_denies(capability):
         PolicyReply(None, "policy.transport_denied", "OSError"),
         PolicyReply({}, "policy.ok", "ok"),
         PolicyReply({"execute": 1}, "policy.ok", "ok"),
-        PolicyReply({"execute": False}, "policy.ok", "ok"),
+        execution(False),
     ],
 )
 def test_execute_requires_literal_true_before_invocation(grant):
@@ -457,6 +591,52 @@ def test_execute_requires_literal_true_before_invocation(grant):
             lambda _: None,
         )
     assert value is None and not reply.allowed and invoked == []
+
+
+@pytest.mark.parametrize(
+    "grant",
+    [
+        execution(extra=True),
+        PolicyReply(
+            {
+                "execute": True,
+                "consumptionID": None,
+                "ruleID": "execute.ok",
+                "reason": "ok",
+            },
+            "policy.ok",
+            "ok",
+        ),
+        execution(True, consumptionID=""),
+        execution(False, consumptionID="consumption-1"),
+        execution(True, ruleID=""),
+        execution(True, reason=""),
+        PolicyReply(
+            {
+                "execute": 1,
+                "consumptionID": "consumption-1",
+                "ruleID": "execute.ok",
+                "reason": "ok",
+            },
+            "policy.ok",
+            "ok",
+        ),
+    ],
+)
+def test_closed_execute_contract_denies_malformed_shapes_before_invocation(grant):
+    prov = DeskPilotProvenance("ui", None, "trace-1")
+    invoked = []
+    with provenance(prov):
+        value, reply = guarded_tool_call(
+            FakePolicy([authorization(), grant]),
+            AdmittedRequest(prov, "a"),
+            "cua_click",
+            {},
+            lambda: invoked.append(True),
+            lambda _: None,
+        )
+    assert value is None and reply.rule_id == "policy.malformed_reply"
+    assert invoked == []
 
 
 def test_missing_current_provenance_denies_without_policy_or_invocation():

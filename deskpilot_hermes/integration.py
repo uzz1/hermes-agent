@@ -2,8 +2,9 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from deskpilot_hermes.policy import ParentPolicyClient, PolicyReply
 from deskpilot_hermes.provenance import DeskPilotProvenance, require_provenance
@@ -56,6 +57,17 @@ ACTION_EXECUTORS = {
     "developer.digest": "file",
 }
 
+_AUTHORIZATION_FIELDS = {
+    "decision",
+    "actionDigest",
+    "pendingApprovalID",
+    "expiresAt",
+}
+_DECISION_FIELDS = {"risk", "verdict", "ruleID", "reason"}
+_RISKS = {"observe", "reversible_local", "mutation", "sensitive", "prohibited"}
+_VERDICTS = {"allow", "ask", "local_confirm", "deny"}
+_EXECUTE_FIELDS = {"execute", "consumptionID", "ruleID", "reason"}
+
 
 @dataclass(frozen=True)
 class AdmittedRequest:
@@ -65,6 +77,74 @@ class AdmittedRequest:
 
 def _denied(rule_id: str, reason: str) -> tuple[None, PolicyReply]:
     return None, PolicyReply(None, rule_id, reason)
+
+
+def _nonempty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
+def _validate_uuid(value: Any) -> None:
+    if not _nonempty_string(value):
+        raise ValueError("UUID must be a nonempty string")
+    UUID(value)
+
+
+def _validate_rfc3339(value: Any) -> None:
+    if not _nonempty_string(value):
+        raise ValueError("expiry must be a nonempty string")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("expiry must include a timezone")
+
+
+def _validate_authorization_result(result: Any) -> tuple[dict[str, Any], str]:
+    if not isinstance(result, dict) or set(result) != _AUTHORIZATION_FIELDS:
+        raise ValueError("authorization result shape")
+    decision = result["decision"]
+    if not isinstance(decision, dict) or set(decision) != _DECISION_FIELDS:
+        raise ValueError("decision shape")
+    if decision["risk"] not in _RISKS or decision["verdict"] not in _VERDICTS:
+        raise ValueError("decision enumeration")
+    if not _nonempty_string(decision["ruleID"]) or not _nonempty_string(
+        decision["reason"]
+    ):
+        raise ValueError("decision rule and reason required")
+
+    verdict = decision["verdict"]
+    action_digest = result["actionDigest"]
+    pending_id = result["pendingApprovalID"]
+    expires_at = result["expiresAt"]
+    if verdict == "deny":
+        if any(value is not None for value in (action_digest, pending_id, expires_at)):
+            raise ValueError("deny must not carry authorization state")
+    elif verdict == "allow":
+        if not _nonempty_string(action_digest):
+            raise ValueError("action digest required")
+        if pending_id is not None or expires_at is not None:
+            raise ValueError("allow must not carry pending approval")
+    else:
+        if not _nonempty_string(action_digest):
+            raise ValueError("action digest required")
+        _validate_uuid(pending_id)
+        _validate_rfc3339(expires_at)
+    return decision, verdict
+
+
+def _validate_execute_result(result: Any) -> bool:
+    if not isinstance(result, dict) or set(result) != _EXECUTE_FIELDS:
+        raise ValueError("execute result shape")
+    execute = result["execute"]
+    if type(execute) is not bool:
+        raise ValueError("execute must be a literal boolean")
+    if not _nonempty_string(result["ruleID"]) or not _nonempty_string(result["reason"]):
+        raise ValueError("execute rule and reason required")
+    consumption_id = result["consumptionID"]
+    if execute:
+        if not _nonempty_string(consumption_id):
+            raise ValueError("successful execute requires consumption ID")
+    elif consumption_id is not None:
+        raise ValueError("denied execute must not carry consumption ID")
+    return execute
 
 
 def admit_sender(
@@ -130,7 +210,9 @@ def admit_scheduled(
     if not isinstance(inputs, dict):
         return None
     try:
-        canonical = json.dumps(inputs, sort_keys=True, separators=(",", ":")).encode()
+        canonical = json.dumps(
+            inputs, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode()
     except (TypeError, ValueError):
         return None
     expected_digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
@@ -200,33 +282,25 @@ def guarded_tool_call(
         if authorization.result is None:
             return None, authorization
         result = authorization.result
-        decision = result["decision"]
-        if not isinstance(decision, dict):
-            raise ValueError("decision must be an object")
-        verdict = decision["verdict"]
-        if verdict not in {"allow", "deny", "ask", "local_confirm"}:
-            raise ValueError("unknown verdict")
+        decision, verdict = _validate_authorization_result(result)
         if verdict == "deny":
-            rule_id = decision["ruleID"]
-            reason = decision["reason"]
-            if not isinstance(rule_id, str) or not isinstance(reason, str):
-                raise ValueError("denial fields must be strings")
-            return _denied(rule_id, reason)
+            return _denied(decision["ruleID"], decision["reason"])
+        if verdict == "local_confirm" and admitted.provenance.entry_point != "ui":
+            return _denied(
+                "policy.approval_denied", "local confirmation requires UI provenance"
+            )
 
         capability = None
         if verdict in {"ask", "local_confirm"}:
             capability = await_local_approval(result)
             if not isinstance(capability, str) or not capability:
                 return _denied("policy.approval_denied", "local approval unavailable")
-        action_digest = result["actionDigest"]
-        if not isinstance(action_digest, str) or not action_digest:
-            raise ValueError("action digest missing")
         grant = client.call(
             "execute",
             {
                 "admissionID": admitted.admission_id,
                 "traceID": admitted.provenance.trace_id,
-                "actionDigest": action_digest,
+                "actionDigest": result["actionDigest"],
                 "confirmationCapability": capability,
             },
         )
@@ -234,13 +308,8 @@ def guarded_tool_call(
             return _denied("policy.malformed_reply", "malformed execution reply")
         if grant.result is None:
             return None, grant
-        if not isinstance(grant.result, dict):
-            return _denied("policy.malformed_reply", "malformed execution reply")
-        execute = grant.result.get("execute")
-        if execute is False:
+        if _validate_execute_result(grant.result) is False:
             return None, grant
-        if execute is not True:
-            return _denied("policy.malformed_reply", "malformed execution reply")
     except (AttributeError, KeyError, TypeError, ValueError):
         return _denied("policy.malformed_reply", "malformed policy reply")
     except Exception as exc:
