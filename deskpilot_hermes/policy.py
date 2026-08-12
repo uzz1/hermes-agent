@@ -10,7 +10,7 @@ from uuid import uuid4
 _PROTOCOL = "deskpilot.policy"
 _VERSION = 1
 _MAX_FRAME = 262_144
-_RESPONSE_FIELDS = {"protocol", "version", "requestID", "result", "error"}
+_RESPONSE_BASE_FIELDS = {"protocol", "version", "requestID"}
 
 
 @dataclass(frozen=True)
@@ -52,8 +52,11 @@ def _read_stream_frame(stream: Any) -> dict[str, Any]:
 def _validate_response(
     response: dict[str, Any], request_id: str
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    if not set(response).issubset(_RESPONSE_FIELDS):
-        raise ValueError("unexpected response fields")
+    keys = set(response)
+    result_branch = _RESPONSE_BASE_FIELDS | {"result"}
+    error_branch = _RESPONSE_BASE_FIELDS | {"error"}
+    if keys != result_branch and keys != error_branch:
+        raise ValueError("response must contain exactly one outcome branch")
     if response.get("protocol") != _PROTOCOL:
         raise ValueError("protocol mismatch")
     if type(response.get("version")) is not int or response["version"] != _VERSION:
@@ -63,8 +66,8 @@ def _validate_response(
 
     result = response.get("result")
     error = response.get("error")
-    if (result is None) == (error is None):
-        raise ValueError("response must contain exactly one non-null outcome")
+    if result is None and error is None:
+        raise ValueError("response outcome must be non-null")
     if result is not None and not isinstance(result, dict):
         raise ValueError("result must be an object")
     if error is not None and not isinstance(error, dict):

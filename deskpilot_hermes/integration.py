@@ -2,7 +2,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Callable
 from uuid import UUID, uuid4
 
@@ -67,6 +67,21 @@ _DECISION_FIELDS = {"risk", "verdict", "ruleID", "reason"}
 _RISKS = {"observe", "reversible_local", "mutation", "sensitive", "prohibited"}
 _VERDICTS = {"allow", "ask", "local_confirm", "deny"}
 _EXECUTE_FIELDS = {"execute", "consumptionID", "ruleID", "reason"}
+_ACTION_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+_RFC3339 = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+)
+_ADMISSION_FIELDS = {
+    "admitted",
+    "ruleID",
+    "reason",
+    "admissionID",
+    "entryPoint",
+    "sender",
+    "principal",
+    "expiresAt",
+}
 
 
 @dataclass(frozen=True)
@@ -83,18 +98,51 @@ def _nonempty_string(value: Any) -> bool:
     return isinstance(value, str) and bool(value)
 
 
+def _validate_action_digest(value: Any) -> None:
+    if not isinstance(value, str) or _ACTION_DIGEST.fullmatch(value) is None:
+        raise ValueError("action digest must be canonical SHA-256")
+
+
 def _validate_uuid(value: Any) -> None:
     if not _nonempty_string(value):
         raise ValueError("UUID must be a nonempty string")
     UUID(value)
 
 
-def _validate_rfc3339(value: Any) -> None:
-    if not _nonempty_string(value):
-        raise ValueError("expiry must be a nonempty string")
+def _validate_rfc3339(value: Any) -> datetime:
+    if not isinstance(value, str) or _RFC3339.fullmatch(value) is None:
+        raise ValueError("expiry must be RFC3339")
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
         raise ValueError("expiry must include a timezone")
+    return parsed
+
+
+def _validate_admission_result(
+    result: Any, entry_point: str, sender: str
+) -> str | None:
+    if not isinstance(result, dict) or set(result) != _ADMISSION_FIELDS:
+        raise ValueError("admission result shape")
+    admitted = result["admitted"]
+    if type(admitted) is not bool:
+        raise ValueError("admitted must be a literal boolean")
+    if not _nonempty_string(result["ruleID"]) or not _nonempty_string(result["reason"]):
+        raise ValueError("admission rule and reason required")
+    if result["entryPoint"] != entry_point or result["sender"] != sender:
+        raise ValueError("admission identity mismatch")
+
+    admission_id = result["admissionID"]
+    principal = result["principal"]
+    expires_at = result["expiresAt"]
+    if admitted:
+        if not _nonempty_string(admission_id) or not _nonempty_string(principal):
+            raise ValueError("successful admission identity required")
+        if _validate_rfc3339(expires_at) <= datetime.now(UTC):
+            raise ValueError("admission already expired")
+        return admission_id
+    if any(value is not None for value in (admission_id, principal, expires_at)):
+        raise ValueError("denied admission must not carry admission state")
+    return None
 
 
 def _validate_authorization_result(result: Any) -> tuple[dict[str, Any], str]:
@@ -115,18 +163,20 @@ def _validate_authorization_result(result: Any) -> tuple[dict[str, Any], str]:
     pending_id = result["pendingApprovalID"]
     expires_at = result["expiresAt"]
     if verdict == "deny":
-        if any(value is not None for value in (action_digest, pending_id, expires_at)):
-            raise ValueError("deny must not carry authorization state")
+        if action_digest is not None:
+            _validate_action_digest(action_digest)
+        if pending_id is not None or expires_at is not None:
+            raise ValueError("deny must not carry pending approval")
     elif verdict == "allow":
-        if not _nonempty_string(action_digest):
-            raise ValueError("action digest required")
+        _validate_action_digest(action_digest)
         if pending_id is not None or expires_at is not None:
             raise ValueError("allow must not carry pending approval")
     else:
-        if not _nonempty_string(action_digest):
-            raise ValueError("action digest required")
+        _validate_action_digest(action_digest)
         _validate_uuid(pending_id)
-        _validate_rfc3339(expires_at)
+        remaining = (_validate_rfc3339(expires_at) - datetime.now(UTC)).total_seconds()
+        if remaining <= 0.0 or remaining > 300.0:
+            raise ValueError("pending authorization expiry out of bounds")
     return decision, verdict
 
 
@@ -140,8 +190,7 @@ def _validate_execute_result(result: Any) -> bool:
         raise ValueError("execute rule and reason required")
     consumption_id = result["consumptionID"]
     if execute:
-        if not _nonempty_string(consumption_id):
-            raise ValueError("successful execute requires consumption ID")
+        _validate_uuid(consumption_id)
     elif consumption_id is not None:
         raise ValueError("denied execute must not carry consumption ID")
     return execute
@@ -177,11 +226,11 @@ def admit_sender(
     )
     if not isinstance(reply, PolicyReply):
         return None
-    result = reply.result
-    if not isinstance(result, dict) or result.get("admitted") is not True:
+    try:
+        admission_id = _validate_admission_result(reply.result, platform, sender)
+    except (TypeError, ValueError):
         return None
-    admission_id = result.get("admissionID")
-    if not isinstance(admission_id, str) or not admission_id:
+    if admission_id is None:
         return None
     request = AdmittedRequest(
         DeskPilotProvenance(platform, sender, str(uuid4())), admission_id
@@ -234,11 +283,11 @@ def admit_scheduled(
     )
     if not isinstance(reply, PolicyReply):
         return None
-    result = reply.result
-    if not isinstance(result, dict) or result.get("admitted") is not True:
+    try:
+        admission_id = _validate_admission_result(reply.result, "scheduler", sender)
+    except (TypeError, ValueError):
         return None
-    admission_id = result.get("admissionID")
-    if not isinstance(admission_id, str) or not admission_id:
+    if admission_id is None:
         return None
     return AdmittedRequest(
         DeskPilotProvenance("scheduler", sender, str(uuid4())), admission_id

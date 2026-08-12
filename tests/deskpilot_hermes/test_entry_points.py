@@ -1,6 +1,7 @@
 import hashlib
 import json
 from copy import deepcopy
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -17,6 +18,8 @@ from deskpilot_hermes.provenance import DeskPilotProvenance, provenance
 
 
 PENDING_ID = "74e96407-e06c-4784-825f-36315b0be447"
+ACTION_DIGEST = "sha256:" + "a" * 64
+CONSUMPTION_ID = "d10f4f35-18b8-48e9-a146-4e70f82ea19b"
 
 
 class FakePolicy:
@@ -29,9 +32,40 @@ class FakePolicy:
         return self.replies.pop(0)
 
 
-def admitted_reply(admission_id="admission-1"):
+def admitted_reply(
+    admission_id="admission-1",
+    entry_point="telegram",
+    sender="telegram:100000001",
+    **extra,
+):
+    result = {
+        "admitted": True,
+        "ruleID": "admit.allowed",
+        "reason": "admitted",
+        "admissionID": admission_id,
+        "entryPoint": entry_point,
+        "sender": sender,
+        "principal": "principal-1",
+        "expiresAt": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+    }
+    result.update(extra)
+    return PolicyReply(result, "policy.ok", "ok")
+
+
+def denied_admission(entry_point="telegram", sender="telegram:100000001"):
     return PolicyReply(
-        {"admitted": True, "admissionID": admission_id}, "policy.ok", "ok"
+        {
+            "admitted": False,
+            "ruleID": "admit.denied",
+            "reason": "denied",
+            "admissionID": None,
+            "entryPoint": entry_point,
+            "sender": sender,
+            "principal": None,
+            "expiresAt": None,
+        },
+        "policy.ok",
+        "ok",
     )
 
 
@@ -43,11 +77,11 @@ def authorization(verdict="allow", **extra):
             "ruleID": "decision.rule",
             "reason": "reason",
         },
-        "actionDigest": None if verdict == "deny" else "sha256:digest",
+        "actionDigest": None if verdict == "deny" else ACTION_DIGEST,
         "pendingApprovalID": PENDING_ID
         if verdict in {"ask", "local_confirm"}
         else None,
-        "expiresAt": "2099-08-12T12:00:00Z"
+        "expiresAt": (datetime.now(UTC) + timedelta(seconds=60)).isoformat()
         if verdict in {"ask", "local_confirm"}
         else None,
     }
@@ -58,7 +92,7 @@ def authorization(verdict="allow", **extra):
 def execution(execute=True, **extra):
     result = {
         "execute": execute,
-        "consumptionID": "consumption-1" if execute else None,
+        "consumptionID": CONSUMPTION_ID if execute else None,
         "ruleID": "execute.allowed" if execute else "execute.denied",
         "reason": "executed" if execute else "denied",
     }
@@ -119,7 +153,7 @@ def test_tool_mapping_and_executor_contract_is_exact():
 )
 def test_sender_is_admitted_before_agent_construction(platform, sender_id, canonical):
     events = []
-    policy = FakePolicy([admitted_reply()])
+    policy = FakePolicy([admitted_reply(entry_point=platform, sender=canonical)])
 
     result = admit_sender(
         policy,
@@ -179,14 +213,68 @@ def test_socket_denial_constructs_no_agent():
 
 
 def test_sender_requires_exact_admitted_shape_and_nonempty_admission_id():
-    for result in (
-        {"admitted": 1, "admissionID": "a"},
-        {"admitted": True, "admissionID": ""},
-        {"admitted": True},
-        None,
-    ):
+    for result in ({"admitted": 1, "admissionID": "a"}, None):
         policy = FakePolicy([PolicyReply(result, "policy.ok", "ok")])
         assert admit_sender(policy, "telegram", "42", lambda _: "agent") is None
+
+
+def _malformed_admission_replies():
+    cases = []
+
+    def changed(**updates):
+        result = deepcopy(admitted_reply().result)
+        result.update(updates)
+        return PolicyReply(result, "policy.ok", "ok")
+
+    cases.extend([
+        changed(extra=True),
+        changed(admitted=1),
+        changed(ruleID=""),
+        changed(reason=""),
+        changed(admissionID=""),
+        changed(entryPoint="signal"),
+        changed(sender="telegram:999"),
+        changed(principal=None),
+        changed(principal=""),
+        changed(expiresAt=None),
+        changed(expiresAt="not-rfc3339"),
+        changed(expiresAt="2099-08-12T12:00:00"),
+        changed(expiresAt="2099-08-12 12:00:00+00:00"),
+        changed(expiresAt=(datetime.now(UTC) - timedelta(seconds=1)).isoformat()),
+    ])
+    denied = deepcopy(denied_admission().result)
+    denied["admissionID"] = "unexpected"
+    cases.append(PolicyReply(denied, "policy.ok", "ok"))
+    denied = deepcopy(denied_admission().result)
+    denied["principal"] = "unexpected"
+    cases.append(PolicyReply(denied, "policy.ok", "ok"))
+    denied = deepcopy(denied_admission().result)
+    denied["expiresAt"] = (datetime.now(UTC) + timedelta(minutes=5)).isoformat()
+    cases.append(PolicyReply(denied, "policy.ok", "ok"))
+    denied = deepcopy(denied_admission().result)
+    denied["ruleID"] = ""
+    cases.append(PolicyReply(denied, "policy.ok", "ok"))
+    return cases
+
+
+@pytest.mark.parametrize("reply", _malformed_admission_replies())
+def test_sender_rejects_malformed_or_uncorrelated_admission_before_construction(reply):
+    constructed = []
+    result = admit_sender(
+        FakePolicy([reply]), "telegram", "100000001", constructed.append
+    )
+    assert result is None and constructed == []
+
+
+def test_correlated_admission_denial_constructs_no_agent():
+    constructed = []
+    result = admit_sender(
+        FakePolicy([denied_admission()]),
+        "telegram",
+        "100000001",
+        constructed.append,
+    )
+    assert result is None and constructed == []
 
 
 def test_malformed_sender_policy_reply_fails_closed():
@@ -205,7 +293,9 @@ def test_scheduler_verifies_exact_compiled_envelope_before_admission():
             json.dumps(inputs, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
     )
-    policy = FakePolicy([admitted_reply()])
+    policy = FakePolicy([
+        admitted_reply(entry_point="scheduler", sender="job:health.exception")
+    ])
 
     admitted = admit_scheduled(
         policy,
@@ -309,6 +399,26 @@ def test_malformed_scheduler_policy_reply_fails_closed():
     )
 
 
+def test_scheduler_rejects_mismatched_admission_identity():
+    digest = "sha256:" + hashlib.sha256(b"{}").hexdigest()
+    policy = FakePolicy([
+        admitted_reply(entry_point="scheduler", sender="job:other-job")
+    ])
+    assert (
+        admit_scheduled(
+            policy,
+            {
+                "jobID": "job",
+                "actionID": "health.observe",
+                "actionVersion": 1,
+                "inputDigest": digest,
+                "inputs": {},
+            },
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), float("-inf")])
 def test_scheduler_rejects_nonfinite_json_before_policy_call(nonfinite):
     inputs = {"value": nonfinite}
@@ -361,7 +471,7 @@ def test_guarded_allow_authorizes_executes_then_invokes_once():
             {
                 "admissionID": "admission-1",
                 "traceID": "trace-1",
-                "actionDigest": "sha256:digest",
+                "actionDigest": ACTION_DIGEST,
                 "confirmationCapability": None,
             },
         ),
@@ -422,12 +532,21 @@ def _malformed_authorizations():
         changed(pendingApprovalID=PENDING_ID),
         changed(expiresAt="2099-08-12T12:00:00Z"),
         changed(actionDigest=None),
+        changed(actionDigest="sha256:digest"),
+        changed(actionDigest="sha256:" + "A" * 64),
+        changed(actionDigest="sha256:" + "a" * 63),
         changed("ask", pendingApprovalID="not-a-uuid"),
         changed("ask", expiresAt="not-rfc3339"),
         changed("ask", expiresAt="2099-08-12T12:00:00"),
+        changed(
+            "ask",
+            expiresAt=(datetime.now(UTC) + timedelta(seconds=60))
+            .isoformat()
+            .replace("T", " "),
+        ),
         changed("ask", pendingApprovalID=None),
         changed("ask", expiresAt=None),
-        changed("deny", actionDigest="sha256:digest"),
+        changed("deny", actionDigest="sha256:invalid"),
         changed("deny", pendingApprovalID=PENDING_ID),
         changed("deny", expiresAt="2099-08-12T12:00:00Z"),
     ])
@@ -457,12 +576,19 @@ def test_closed_authorization_contract_denies_malformed_shapes_before_callback_o
     assert [method for method, _ in policy.calls] == ["authorize"]
 
 
-def test_deny_uses_policy_decision_and_never_invokes():
-    prov = DeskPilotProvenance("ui", None, "trace-1")
+@pytest.mark.parametrize(
+    ("prov", "action_digest"),
+    [
+        (DeskPilotProvenance("ui", None, "trace-1"), ACTION_DIGEST),
+        (DeskPilotProvenance("scheduler", "job:health", "trace-1"), None),
+    ],
+)
+def test_deny_uses_policy_decision_and_never_invokes(prov, action_digest):
     invoked = []
+    policy = FakePolicy([authorization("deny", actionDigest=action_digest)])
     with provenance(prov):
         value, reply = guarded_tool_call(
-            FakePolicy([authorization("deny")]),
+            policy,
             AdmittedRequest(prov, "a"),
             "cua_click",
             {},
@@ -474,6 +600,7 @@ def test_deny_uses_policy_decision_and_never_invokes():
         "reason",
     )
     assert invoked == []
+    assert [method for method, _ in policy.calls] == ["authorize"]
 
 
 @pytest.mark.parametrize("verdict", ["ask", "local_confirm"])
@@ -553,6 +680,30 @@ def test_local_confirm_is_denied_outside_ui_before_callback_or_execute(prov):
     assert [method for method, _ in policy.calls] == ["authorize"]
 
 
+@pytest.mark.parametrize("offset_seconds", [-1, 600])
+def test_pending_authorization_rejects_invalid_expiry_before_callback(offset_seconds):
+    prov = DeskPilotProvenance("ui", None, "trace-1")
+    auth = authorization(
+        "ask",
+        expiresAt=(datetime.now(UTC) + timedelta(seconds=offset_seconds)).isoformat(),
+    )
+    callbacks = []
+    invoked = []
+    policy = FakePolicy([auth])
+    with provenance(prov):
+        value, reply = guarded_tool_call(
+            policy,
+            AdmittedRequest(prov, "a"),
+            "cua_click",
+            {},
+            lambda: invoked.append(True),
+            lambda result: callbacks.append(result) or "local-capability",
+        )
+    assert value is None and reply.rule_id == "policy.malformed_reply"
+    assert callbacks == [] and invoked == []
+    assert [method for method, _ in policy.calls] == ["authorize"]
+
+
 @pytest.mark.parametrize("capability", [None, "", 7])
 def test_missing_or_invalid_local_capability_denies(capability):
     prov = DeskPilotProvenance("ui", None, "trace-1")
@@ -608,13 +759,14 @@ def test_execute_requires_literal_true_before_invocation(grant):
             "ok",
         ),
         execution(True, consumptionID=""),
-        execution(False, consumptionID="consumption-1"),
+        execution(False, consumptionID=CONSUMPTION_ID),
+        execution(True, consumptionID="not-a-uuid"),
         execution(True, ruleID=""),
         execution(True, reason=""),
         PolicyReply(
             {
                 "execute": 1,
-                "consumptionID": "consumption-1",
+                "consumptionID": CONSUMPTION_ID,
                 "ruleID": "execute.ok",
                 "reason": "ok",
             },

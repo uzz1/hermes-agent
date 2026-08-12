@@ -129,6 +129,25 @@ def test_call_rejects_extra_nested_error_fields(tmp_path):
     assert reply.result is None and reply.rule_id == "policy.transport_denied"
 
 
+@pytest.mark.parametrize("branch", ["result_with_null_error", "error_with_null_result"])
+def test_call_requires_exact_top_level_outcome_branch_keys(tmp_path, branch):
+    def handler(request, connection):
+        if branch == "result_with_null_error":
+            frame = response_for(request, result={"ok": True}, error=None)
+        else:
+            frame = response_for(
+                request,
+                error={"ruleID": "admit.denied", "reason": "no"},
+                result=None,
+            )
+        send_frame(connection, frame)
+
+    with unix_server(tmp_path, handler) as path:
+        reply = ParentPolicyClient(path).call("admit", {})
+
+    assert reply.result is None and reply.rule_id == "policy.transport_denied"
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
