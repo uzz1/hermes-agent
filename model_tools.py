@@ -322,10 +322,7 @@ def get_tool_definitions(
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             os.environ.get("DESKPILOT_MODE"),
-            bool(
-                _is_closed_deskpilot_surface(enabled_toolsets)
-                and not os.environ.get("HERMES_KANBAN_TASK")
-            ),
+            _is_closed_deskpilot_surface(enabled_toolsets),
             bool(skip_tool_search_assembly),
         )
         cached = _tool_defs_cache.get(cache_key)
@@ -371,16 +368,20 @@ def _compute_tool_definitions(
 
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
-        if os.environ.get("HERMES_KANBAN_TASK") and "kanban" not in effective_enabled_toolsets:
+        deskpilot_closed_surface = _is_closed_deskpilot_surface(
+            effective_enabled_toolsets
+        )
+        if (
+            os.environ.get("HERMES_KANBAN_TASK")
+            and not deskpilot_closed_surface
+            and "kanban" not in effective_enabled_toolsets
+        ):
             # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and
             # must always receive the lifecycle handoff tools. Assignee
             # profiles may intentionally restrict their normal chat toolsets
             # (for token/cost reasons), but that should not strip the kanban
             # worker's completion/block/heartbeat surface.
             effective_enabled_toolsets.append("kanban")
-        deskpilot_closed_surface = _is_closed_deskpilot_surface(
-            effective_enabled_toolsets
-        )
         for toolset_name in effective_enabled_toolsets:
             if validate_toolset(toolset_name):
                 resolved = resolve_toolset(toolset_name)

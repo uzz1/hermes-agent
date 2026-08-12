@@ -185,6 +185,90 @@ def test_exact_deskpilot_surface_cache_does_not_alias_duplicate_list(
     assert observed[list] == {"tool_search", "tool_describe", "tool_call"}
 
 
+@pytest.mark.parametrize("selection_kind", ["literal_list", "platform_set"])
+def test_closed_deskpilot_surface_precedes_kanban_worker_expansion(
+    monkeypatch, selection_kind
+):
+    monkeypatch.setenv("DESKPILOT_MODE", "1")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_deskpilot")
+    monkeypatch.setattr(
+        "tools.tool_search.load_config",
+        lambda: type(
+            "Config",
+            (),
+            {
+                "enabled": "on",
+                "threshold_pct": 0.0,
+                "min_tools": 1,
+                "always_available": frozenset(),
+            },
+        )(),
+    )
+    if selection_kind == "literal_list":
+        enabled_toolsets = ["deskpilot"]
+    else:
+        enabled_toolsets = tools_config._get_platform_tools(
+            {"platform_toolsets": {"cli": ["deskpilot", "no_mcp"]}},
+            "cli",
+        )
+    _reset_definition_caches()
+
+    names = set(
+        _functions(
+            model_tools.get_tool_definitions(
+                enabled_toolsets=enabled_toolsets,
+                quiet_mode=True,
+            )
+        )
+    )
+
+    assert names == DESKPILOT_NAMES
+    assert not any(name.startswith("kanban_") for name in names)
+    assert names.isdisjoint({"tool_search", "tool_describe", "tool_call"})
+
+
+def test_ordinary_kanban_worker_still_expands_restricted_toolsets(monkeypatch):
+    monkeypatch.delenv("DESKPILOT_MODE", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_ordinary")
+    _reset_definition_caches()
+
+    names = set(
+        _functions(
+            model_tools.get_tool_definitions(
+                enabled_toolsets=["terminal"],
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+        )
+    )
+
+    assert {"kanban_show", "kanban_complete", "kanban_block"}.issubset(names)
+
+
+@pytest.mark.parametrize(
+    "enabled_toolsets",
+    [["deskpilot", "deskpilot"], ["deskpilot", "terminal"]],
+)
+def test_nonexact_deskpilot_selection_does_not_suppress_kanban(
+    monkeypatch, enabled_toolsets
+):
+    monkeypatch.setenv("DESKPILOT_MODE", "1")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_nonexact")
+    _reset_definition_caches()
+
+    names = set(
+        _functions(
+            model_tools.get_tool_definitions(
+                enabled_toolsets=enabled_toolsets,
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+        )
+    )
+
+    assert {"kanban_show", "kanban_complete", "kanban_block"}.issubset(names)
+
+
 def test_globally_registered_browseros_mcp_stays_out(monkeypatch):
     monkeypatch.setenv("DESKPILOT_MODE", "1")
     name = "mcp_browseros_private_test"
