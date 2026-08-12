@@ -20,20 +20,25 @@ from deskpilot_hermes.provenance import DeskPilotProvenance, provenance
 PENDING_ID = "74e96407-e06c-4784-825f-36315b0be447"
 ACTION_DIGEST = "sha256:" + "a" * 64
 CONSUMPTION_ID = "d10f4f35-18b8-48e9-a146-4e70f82ea19b"
+ADMISSION_ID = "a399f2e8-c425-49d7-9f90-67d46c436aa0"
+TRACE_ID = "b4783542-8cc5-4b03-a43f-239445405eed"
 
 
 class FakePolicy:
-    def __init__(self, replies):
+    def __init__(self, replies, on_call=None):
         self.replies = list(replies)
         self.calls = []
+        self.on_call = on_call
 
     def call(self, method, params):
         self.calls.append((method, params))
+        if self.on_call is not None:
+            self.on_call(method, params)
         return self.replies.pop(0)
 
 
 def admitted_reply(
-    admission_id="admission-1",
+    admission_id=ADMISSION_ID,
     entry_point="telegram",
     sender="telegram:100000001",
     **extra,
@@ -46,7 +51,7 @@ def admitted_reply(
         "entryPoint": entry_point,
         "sender": sender,
         "principal": "principal-1",
-        "expiresAt": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+        "expiresAt": (datetime.now(UTC) + timedelta(seconds=60)).isoformat(),
     }
     result.update(extra)
     return PolicyReply(result, "policy.ok", "ok")
@@ -179,7 +184,7 @@ def test_sender_is_admitted_before_agent_construction(platform, sender_id, canon
     ]
     assert events[0][0] == "construct"
     request = events[0][1]
-    assert request.admission_id == "admission-1"
+    assert request.admission_id == ADMISSION_ID
     assert request.provenance.entry_point == platform
     assert request.provenance.sender == canonical
     assert request.provenance.trace_id
@@ -232,6 +237,7 @@ def _malformed_admission_replies():
         changed(ruleID=""),
         changed(reason=""),
         changed(admissionID=""),
+        changed(admissionID=ADMISSION_ID.upper()),
         changed(entryPoint="signal"),
         changed(sender="telegram:999"),
         changed(principal=None),
@@ -241,6 +247,7 @@ def _malformed_admission_replies():
         changed(expiresAt="2099-08-12T12:00:00"),
         changed(expiresAt="2099-08-12 12:00:00+00:00"),
         changed(expiresAt=(datetime.now(UTC) - timedelta(seconds=1)).isoformat()),
+        changed(expiresAt=(datetime.now(UTC) + timedelta(seconds=301)).isoformat()),
     ])
     denied = deepcopy(denied_admission().result)
     denied["admissionID"] = "unexpected"
@@ -439,8 +446,8 @@ def test_scheduler_rejects_nonfinite_json_before_policy_call(nonfinite):
 
 
 def test_guarded_allow_authorizes_executes_then_invokes_once():
-    prov = DeskPilotProvenance("ui", None, "trace-1")
-    admitted = AdmittedRequest(prov, "admission-1")
+    prov = DeskPilotProvenance("ui", None, TRACE_ID)
+    admitted = AdmittedRequest(prov, ADMISSION_ID)
     policy = FakePolicy([authorization(), execution()])
     invoked = []
 
@@ -459,8 +466,8 @@ def test_guarded_allow_authorizes_executes_then_invokes_once():
         (
             "authorize",
             {
-                "admissionID": "admission-1",
-                "traceID": "trace-1",
+                "admissionID": ADMISSION_ID,
+                "traceID": TRACE_ID,
                 "actionID": "cua.click",
                 "actionVersion": 1,
                 "inputs": {"x": 1},
@@ -469,8 +476,8 @@ def test_guarded_allow_authorizes_executes_then_invokes_once():
         (
             "execute",
             {
-                "admissionID": "admission-1",
-                "traceID": "trace-1",
+                "admissionID": ADMISSION_ID,
+                "traceID": TRACE_ID,
                 "actionDigest": ACTION_DIGEST,
                 "confirmationCapability": None,
             },
@@ -493,12 +500,12 @@ def test_guarded_allow_authorizes_executes_then_invokes_once():
     ],
 )
 def test_transport_or_malformed_authorization_never_invokes(reply):
-    prov = DeskPilotProvenance("ui", None, "trace-1")
+    prov = DeskPilotProvenance("ui", None, TRACE_ID)
     invoked = []
     with provenance(prov):
         value, denied = guarded_tool_call(
             FakePolicy([reply]),
-            AdmittedRequest(prov, "a"),
+            AdmittedRequest(prov, ADMISSION_ID),
             "cua_click",
             {},
             lambda: invoked.append(True),
@@ -557,14 +564,14 @@ def _malformed_authorizations():
 def test_closed_authorization_contract_denies_malformed_shapes_before_callback_or_invoke(
     reply,
 ):
-    prov = DeskPilotProvenance("ui", None, "trace-1")
+    prov = DeskPilotProvenance("ui", None, TRACE_ID)
     callbacks = []
     invoked = []
     policy = FakePolicy([reply])
     with provenance(prov):
         value, denied = guarded_tool_call(
             policy,
-            AdmittedRequest(prov, "a"),
+            AdmittedRequest(prov, ADMISSION_ID),
             "cua_click",
             {},
             lambda: invoked.append(True),
@@ -579,8 +586,8 @@ def test_closed_authorization_contract_denies_malformed_shapes_before_callback_o
 @pytest.mark.parametrize(
     ("prov", "action_digest"),
     [
-        (DeskPilotProvenance("ui", None, "trace-1"), ACTION_DIGEST),
-        (DeskPilotProvenance("scheduler", "job:health", "trace-1"), None),
+        (DeskPilotProvenance("ui", None, TRACE_ID), ACTION_DIGEST),
+        (DeskPilotProvenance("scheduler", "job:health", TRACE_ID), None),
     ],
 )
 def test_deny_uses_policy_decision_and_never_invokes(prov, action_digest):
@@ -589,7 +596,7 @@ def test_deny_uses_policy_decision_and_never_invokes(prov, action_digest):
     with provenance(prov):
         value, reply = guarded_tool_call(
             policy,
-            AdmittedRequest(prov, "a"),
+            AdmittedRequest(prov, ADMISSION_ID),
             "cua_click",
             {},
             lambda: invoked.append(True),
@@ -606,9 +613,9 @@ def test_deny_uses_policy_decision_and_never_invokes(prov, action_digest):
 @pytest.mark.parametrize("verdict", ["ask", "local_confirm"])
 def test_local_confirmation_failure_and_remote_response_never_invoke(verdict):
     prov = (
-        DeskPilotProvenance("ui", None, "trace-1")
+        DeskPilotProvenance("ui", None, TRACE_ID)
         if verdict == "local_confirm"
-        else DeskPilotProvenance("telegram", "telegram:42", "trace-1")
+        else DeskPilotProvenance("telegram", "telegram:42", TRACE_ID)
     )
     auth = authorization(verdict)
     callbacks = []
@@ -616,7 +623,7 @@ def test_local_confirmation_failure_and_remote_response_never_invoke(verdict):
     with provenance(prov):
         value, reply = guarded_tool_call(
             FakePolicy([auth]),
-            AdmittedRequest(prov, "a"),
+            AdmittedRequest(prov, ADMISSION_ID),
             "cua_click",
             {},
             lambda: invoked.append(True),
@@ -632,9 +639,9 @@ def test_local_confirmation_failure_and_remote_response_never_invoke(verdict):
 @pytest.mark.parametrize("verdict", ["ask", "local_confirm"])
 def test_ask_resumes_only_with_nonempty_supplied_local_capability(verdict):
     prov = (
-        DeskPilotProvenance("ui", None, "trace-1")
+        DeskPilotProvenance("ui", None, TRACE_ID)
         if verdict == "local_confirm"
-        else DeskPilotProvenance("telegram", "telegram:42", "trace-1")
+        else DeskPilotProvenance("telegram", "telegram:42", TRACE_ID)
     )
     policy = FakePolicy([
         authorization(verdict),
@@ -644,7 +651,7 @@ def test_ask_resumes_only_with_nonempty_supplied_local_capability(verdict):
     with provenance(prov):
         value, _ = guarded_tool_call(
             policy,
-            AdmittedRequest(prov, "a"),
+            AdmittedRequest(prov, ADMISSION_ID),
             "cua_click",
             {},
             lambda: invoked.append(True) or "done",
@@ -657,9 +664,9 @@ def test_ask_resumes_only_with_nonempty_supplied_local_capability(verdict):
 @pytest.mark.parametrize(
     "prov",
     [
-        DeskPilotProvenance("telegram", "telegram:42", "trace-1"),
-        DeskPilotProvenance("signal", "signal:+27820000000", "trace-1"),
-        DeskPilotProvenance("scheduler", "job:health", "trace-1"),
+        DeskPilotProvenance("telegram", "telegram:42", TRACE_ID),
+        DeskPilotProvenance("signal", "signal:+27820000000", TRACE_ID),
+        DeskPilotProvenance("scheduler", "job:health", TRACE_ID),
     ],
 )
 def test_local_confirm_is_denied_outside_ui_before_callback_or_execute(prov):
@@ -669,7 +676,7 @@ def test_local_confirm_is_denied_outside_ui_before_callback_or_execute(prov):
     with provenance(prov):
         value, reply = guarded_tool_call(
             policy,
-            AdmittedRequest(prov, "a"),
+            AdmittedRequest(prov, ADMISSION_ID),
             "cua_click",
             {},
             lambda: invoked.append(True),
@@ -682,7 +689,7 @@ def test_local_confirm_is_denied_outside_ui_before_callback_or_execute(prov):
 
 @pytest.mark.parametrize("offset_seconds", [-1, 600])
 def test_pending_authorization_rejects_invalid_expiry_before_callback(offset_seconds):
-    prov = DeskPilotProvenance("ui", None, "trace-1")
+    prov = DeskPilotProvenance("ui", None, TRACE_ID)
     auth = authorization(
         "ask",
         expiresAt=(datetime.now(UTC) + timedelta(seconds=offset_seconds)).isoformat(),
@@ -693,7 +700,7 @@ def test_pending_authorization_rejects_invalid_expiry_before_callback(offset_sec
     with provenance(prov):
         value, reply = guarded_tool_call(
             policy,
-            AdmittedRequest(prov, "a"),
+            AdmittedRequest(prov, ADMISSION_ID),
             "cua_click",
             {},
             lambda: invoked.append(True),
@@ -706,12 +713,12 @@ def test_pending_authorization_rejects_invalid_expiry_before_callback(offset_sec
 
 @pytest.mark.parametrize("capability", [None, "", 7])
 def test_missing_or_invalid_local_capability_denies(capability):
-    prov = DeskPilotProvenance("ui", None, "trace-1")
+    prov = DeskPilotProvenance("ui", None, TRACE_ID)
     invoked = []
     with provenance(prov):
         value, _ = guarded_tool_call(
             FakePolicy([authorization("ask")]),
-            AdmittedRequest(prov, "a"),
+            AdmittedRequest(prov, ADMISSION_ID),
             "cua_click",
             {},
             lambda: invoked.append(True),
@@ -730,12 +737,12 @@ def test_missing_or_invalid_local_capability_denies(capability):
     ],
 )
 def test_execute_requires_literal_true_before_invocation(grant):
-    prov = DeskPilotProvenance("ui", None, "trace-1")
+    prov = DeskPilotProvenance("ui", None, TRACE_ID)
     invoked = []
     with provenance(prov):
         value, reply = guarded_tool_call(
             FakePolicy([authorization(), grant]),
-            AdmittedRequest(prov, "a"),
+            AdmittedRequest(prov, ADMISSION_ID),
             "cua_click",
             {},
             lambda: invoked.append(True),
@@ -761,6 +768,7 @@ def test_execute_requires_literal_true_before_invocation(grant):
         execution(True, consumptionID=""),
         execution(False, consumptionID=CONSUMPTION_ID),
         execution(True, consumptionID="not-a-uuid"),
+        execution(True, consumptionID=CONSUMPTION_ID.upper()),
         execution(True, ruleID=""),
         execution(True, reason=""),
         PolicyReply(
@@ -776,12 +784,12 @@ def test_execute_requires_literal_true_before_invocation(grant):
     ],
 )
 def test_closed_execute_contract_denies_malformed_shapes_before_invocation(grant):
-    prov = DeskPilotProvenance("ui", None, "trace-1")
+    prov = DeskPilotProvenance("ui", None, TRACE_ID)
     invoked = []
     with provenance(prov):
         value, reply = guarded_tool_call(
             FakePolicy([authorization(), grant]),
-            AdmittedRequest(prov, "a"),
+            AdmittedRequest(prov, ADMISSION_ID),
             "cua_click",
             {},
             lambda: invoked.append(True),
@@ -791,13 +799,131 @@ def test_closed_execute_contract_denies_malformed_shapes_before_invocation(grant
     assert invoked == []
 
 
+@pytest.mark.parametrize("stage", ["authorize", "approval", "execute"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_argument_mutation_at_any_policy_boundary_denies_before_invocation(
+    stage, nested
+):
+    prov = DeskPilotProvenance("ui", None, TRACE_ID)
+    arguments = {"value": 1, "nested": {"value": 1}}
+    invoked = []
+
+    def mutate():
+        if nested:
+            arguments["nested"]["value"] = 2
+        else:
+            arguments["value"] = 2
+
+    def on_call(method, _params):
+        if method == stage:
+            mutate()
+
+    verdict = "ask" if stage == "approval" else "allow"
+    policy = FakePolicy([authorization(verdict), execution()], on_call=on_call)
+
+    def approve(_result):
+        mutate()
+        return "local-capability"
+
+    with provenance(prov):
+        value, reply = guarded_tool_call(
+            policy,
+            AdmittedRequest(prov, ADMISSION_ID),
+            "cua_click",
+            arguments,
+            lambda snapshot: invoked.append(snapshot),
+            approve,
+        )
+
+    assert value is None and reply.rule_id == "policy.arguments_changed"
+    assert invoked == []
+
+
+def test_invocation_receives_fresh_copy_of_authorized_arguments():
+    prov = DeskPilotProvenance("ui", None, TRACE_ID)
+    arguments = {"nested": {"value": 1}}
+    received = []
+
+    def invoke(snapshot):
+        received.append(snapshot)
+        snapshot["nested"]["value"] = 2
+        return "done"
+
+    with provenance(prov):
+        value, reply = guarded_tool_call(
+            FakePolicy([authorization(), execution()]),
+            AdmittedRequest(prov, ADMISSION_ID),
+            "cua_click",
+            arguments,
+            invoke,
+            lambda _: None,
+        )
+
+    assert value == "done" and reply.allowed
+    assert received == [{"nested": {"value": 2}}]
+    assert arguments == {"nested": {"value": 1}}
+
+
+def test_invoker_with_unsupported_signature_denies_before_policy_call():
+    prov = DeskPilotProvenance("ui", None, TRACE_ID)
+    policy = FakePolicy([])
+    with provenance(prov):
+        value, reply = guarded_tool_call(
+            policy,
+            AdmittedRequest(prov, ADMISSION_ID),
+            "cua_click",
+            {},
+            lambda _first, _second: None,
+            lambda _: None,
+        )
+    assert value is None and reply.rule_id == "policy.invalid_invoker"
+    assert policy.calls == []
+
+
+def test_guard_rejects_noncanonical_admission_id_before_policy_call():
+    prov = DeskPilotProvenance("ui", None, TRACE_ID)
+    policy = FakePolicy([])
+    with provenance(prov):
+        value, reply = guarded_tool_call(
+            policy,
+            AdmittedRequest(prov, ADMISSION_ID.upper()),
+            "cua_click",
+            {},
+            lambda: pytest.fail("must not invoke"),
+            lambda _: None,
+        )
+    assert value is None and reply.rule_id == "policy.invalid_admission"
+    assert policy.calls == []
+
+
+def test_approval_callback_cannot_rebind_validated_action_digest():
+    prov = DeskPilotProvenance("ui", None, TRACE_ID)
+    policy = FakePolicy([authorization("ask"), execution()])
+
+    def approve(result):
+        result["actionDigest"] = "sha256:" + "b" * 64
+        return "local-capability"
+
+    with provenance(prov):
+        value, _ = guarded_tool_call(
+            policy,
+            AdmittedRequest(prov, ADMISSION_ID),
+            "cua_click",
+            {},
+            lambda: "done",
+            approve,
+        )
+    assert value == "done"
+    assert policy.calls[1][1]["actionDigest"] == ACTION_DIGEST
+
+
 def test_missing_current_provenance_denies_without_policy_or_invocation():
-    prov = DeskPilotProvenance("ui", None, "trace-1")
+    prov = DeskPilotProvenance("ui", None, TRACE_ID)
     policy = FakePolicy([])
     invoked = []
     value, reply = guarded_tool_call(
         policy,
-        AdmittedRequest(prov, "a"),
+        AdmittedRequest(prov, ADMISSION_ID),
         "cua_click",
         {},
         lambda: invoked.append(True),
@@ -809,13 +935,17 @@ def test_missing_current_provenance_denies_without_policy_or_invocation():
 
 def test_provenance_mismatch_unmapped_tool_and_bad_arguments_deny_without_policy():
     current = DeskPilotProvenance("ui", None, "trace-current")
-    admitted = AdmittedRequest(DeskPilotProvenance("ui", None, "trace-other"), "a")
+    admitted = AdmittedRequest(
+        DeskPilotProvenance("ui", None, "trace-other"), ADMISSION_ID
+    )
     for tool_name, arguments in (("cua_click", {}), ("unknown", {}), ("cua_click", [])):
         policy = FakePolicy([])
         with provenance(current):
             value, reply = guarded_tool_call(
                 policy,
-                admitted if tool_name != "unknown" else AdmittedRequest(current, "a"),
+                admitted
+                if tool_name != "unknown"
+                else AdmittedRequest(current, ADMISSION_ID),
                 tool_name,
                 arguments,
                 lambda: pytest.fail("must not invoke"),

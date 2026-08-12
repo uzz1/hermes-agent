@@ -1,8 +1,11 @@
 import json
+import os
 import socket
+import tempfile
 import threading
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -10,6 +13,12 @@ from deskpilot_hermes.policy import ParentPolicyClient, PolicyReply
 
 
 MAX_FRAME = 262_144
+PENDING_ID = "74e96407-e06c-4784-825f-36315b0be447"
+ROUTE_ID = "116771cc-df21-437a-b28d-5944a42c1a45"
+SESSION_ID = "3616552d-1ab5-4565-822f-63fcedb82cab"
+PERMISSION_ID = "b1d75631-5f89-4f4d-a8b0-2b8501bc9a1f"
+EVENT_ID = "6d6fe658-0bd7-4086-9569-7e344cb3d285"
+CONSUMPTION_ID = "d10f4f35-18b8-48e9-a146-4e70f82ea19b"
 
 
 def response_for(request, **outcome):
@@ -22,8 +31,8 @@ def response_for(request, **outcome):
 
 
 @contextmanager
-def unix_server(tmp_path, handler):
-    path = tmp_path / "policy.sock"
+def unix_server(tmp_path, handler, *, path=None, mode=0o600):
+    path = Path(path) if path is not None else tmp_path / "policy.sock"
     ready = threading.Event()
     errors = []
 
@@ -31,6 +40,7 @@ def unix_server(tmp_path, handler):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
                 listener.bind(str(path))
+                os.chmod(path, mode)
                 listener.listen(1)
                 ready.set()
                 connection, _ = listener.accept()
@@ -41,7 +51,8 @@ def unix_server(tmp_path, handler):
                         if not block:
                             break
                         raw.extend(block)
-                    handler(json.loads(raw), connection)
+                    if raw:
+                        handler(json.loads(raw), connection)
         except Exception as exc:  # surfaced in the test thread
             errors.append(exc)
             ready.set()
@@ -58,15 +69,55 @@ def unix_server(tmp_path, handler):
             raise errors[0]
 
 
+@contextmanager
+def bound_socket(path, *, mode=0o600):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(str(path))
+        os.chmod(path, mode)
+        listener.listen(1)
+        yield str(path), listener
+
+
+def assert_no_connection(listener):
+    listener.settimeout(0.05)
+    with pytest.raises(socket.timeout):
+        listener.accept()
+
+
 def send_frame(connection, frame):
     connection.sendall(json.dumps(frame, separators=(",", ":")).encode() + b"\n")
 
 
-def test_policy_reply_allowed_requires_result_and_execute_not_false():
-    assert PolicyReply({}, "policy.ok", "ok").allowed
-    assert PolicyReply({"execute": True}, "policy.ok", "ok").allowed
+def test_policy_reply_allowed_requires_exact_successful_execute_result():
+    successful = {
+        "execute": True,
+        "consumptionID": CONSUMPTION_ID,
+        "ruleID": "execute.allowed",
+        "reason": "authorized",
+    }
+    assert PolicyReply(successful, "policy.ok", "ok").allowed
+    assert not PolicyReply({}, "policy.ok", "ok").allowed
+    assert not PolicyReply({"execute": True}, "policy.ok", "ok").allowed
+    assert not PolicyReply({**successful, "extra": True}, "policy.ok", "ok").allowed
+    assert not PolicyReply(
+        {**successful, "consumptionID": CONSUMPTION_ID.upper()},
+        "policy.ok",
+        "ok",
+    ).allowed
     assert not PolicyReply({"execute": False}, "policy.ok", "ok").allowed
     assert not PolicyReply(None, "policy.denied", "no").allowed
+
+
+@pytest.mark.parametrize(
+    ("value", "exception_name"), [(object(), "TypeError"), (float("nan"), "ValueError")]
+)
+def test_call_rejects_non_json_values_as_transport_denial(
+    tmp_path, value, exception_name
+):
+    reply = ParentPolicyClient(str(tmp_path / "missing.sock")).call(
+        "authorize", {"value": value}
+    )
+    assert reply == PolicyReply(None, "policy.transport_denied", exception_name)
 
 
 def test_call_sends_exact_request_and_accepts_correlated_result(tmp_path):
@@ -198,6 +249,107 @@ def test_missing_uri_and_socket_outage_fail_closed(monkeypatch, tmp_path):
     assert reply.result is None and reply.rule_id == "policy.transport_denied"
 
 
+def test_relative_socket_path_is_rejected():
+    assert ParentPolicyClient("relative.sock").call("admit", {}).rule_id == (
+        "policy.socket_required"
+    )
+
+
+def test_regular_file_is_rejected_as_socket(tmp_path):
+    path = tmp_path / "policy.sock"
+    path.write_text("not a socket")
+    path.chmod(0o600)
+    assert ParentPolicyClient(str(path)).call("admit", {}).rule_id == (
+        "policy.transport_denied"
+    )
+
+
+def test_symlink_socket_path_is_rejected(tmp_path):
+    with bound_socket(tmp_path / "real.sock") as (real_path, listener):
+        link = tmp_path / "policy.sock"
+        link.symlink_to(real_path)
+        assert ParentPolicyClient(str(link)).call("admit", {}).rule_id == (
+            "policy.transport_denied"
+        )
+        assert_no_connection(listener)
+
+
+def test_socket_with_wrong_mode_is_rejected(tmp_path):
+    with bound_socket(tmp_path / "policy.sock", mode=0o660) as (path, listener):
+        assert ParentPolicyClient(path).call("admit", {}).rule_id == (
+            "policy.transport_denied"
+        )
+        assert_no_connection(listener)
+
+
+def test_socket_with_wrong_owner_is_rejected(monkeypatch, tmp_path):
+    with bound_socket(tmp_path / "policy.sock") as (path, listener):
+        monkeypatch.setattr(os, "geteuid", lambda: os.getuid() + 1)
+        assert ParentPolicyClient(path).call("admit", {}).rule_id == (
+            "policy.transport_denied"
+        )
+        assert_no_connection(listener)
+
+
+def test_private_run_directory_permissions_are_required(monkeypatch, tmp_path):
+    with tempfile.TemporaryDirectory(prefix="dph-", dir="/private/tmp") as directory:
+        home = Path(directory)
+        run = home / ".deskpilot" / "run"
+        run.mkdir(parents=True)
+        (home / ".deskpilot").chmod(0o700)
+        run.chmod(0o750)
+        monkeypatch.setenv("HOME", str(home))
+        with bound_socket(run / "policy.sock") as (path, listener):
+            assert ParentPolicyClient(path).call("admit", {}).rule_id == (
+                "policy.transport_denied"
+            )
+            assert_no_connection(listener)
+
+
+def test_socket_inode_swap_is_rejected(monkeypatch, tmp_path):
+    def handler(request, connection):
+        send_frame(connection, response_for(request, result={"ok": True}))
+
+    with unix_server(tmp_path, handler) as path:
+        socket_path = Path(path)
+        original_lstat = Path.lstat
+        calls = 0
+
+        def swapped_lstat(self):
+            nonlocal calls
+            metadata = original_lstat(self)
+            if self == socket_path:
+                calls += 1
+                if calls == 2:
+                    values = list(metadata)
+                    values[1] += 1
+                    return os.stat_result(values)
+            return metadata
+
+        monkeypatch.setattr(Path, "lstat", swapped_lstat)
+        reply = ParentPolicyClient(path).call("admit", {})
+
+    assert reply.result is None and reply.rule_id == "policy.transport_denied"
+
+
+def test_private_absolute_0600_socket_is_accepted(monkeypatch, tmp_path):
+    with tempfile.TemporaryDirectory(prefix="dph-", dir="/private/tmp") as directory:
+        home = Path(directory)
+        run = home / ".deskpilot" / "run"
+        run.mkdir(parents=True)
+        (home / ".deskpilot").chmod(0o700)
+        run.chmod(0o700)
+        monkeypatch.setenv("HOME", str(home))
+
+        def handler(request, connection):
+            send_frame(connection, response_for(request, result={"ok": True}))
+
+        with unix_server(tmp_path, handler, path=run / "policy.sock") as path:
+            reply = ParentPolicyClient(path).call("admit", {})
+
+    assert reply == PolicyReply({"ok": True}, "policy.ok", "authorized")
+
+
 def approval_ack(request):
     expires = (datetime.now(UTC) + timedelta(seconds=2)).isoformat()
     return response_for(
@@ -213,7 +365,7 @@ def approval_ack(request):
 def approval_event(request, resolution="approve", **changes):
     event = {
         "type": "approval.resolved",
-        "eventID": "event-1",
+        "eventID": EVENT_ID,
         **request["params"],
         "resolution": resolution,
         "confirmationCapability": "local-capability",
@@ -232,7 +384,7 @@ def test_approval_subscribe_sends_exact_correlation_and_returns_only_approve(tmp
 
     with unix_server(tmp_path, handler) as path:
         event = ParentPolicyClient(path).subscribe_approval(
-            "pending-1", "route-1", "session-1", "permission-1"
+            PENDING_ID, ROUTE_ID, SESSION_ID, PERMISSION_ID
         )
 
     assert requests[0].keys() == {
@@ -244,10 +396,10 @@ def test_approval_subscribe_sends_exact_correlation_and_returns_only_approve(tmp
     }
     assert requests[0]["method"] == "approval.subscribe"
     assert requests[0]["params"] == {
-        "pendingApprovalID": "pending-1",
-        "routeID": "route-1",
-        "sessionID": "session-1",
-        "permissionRequestID": "permission-1",
+        "pendingApprovalID": PENDING_ID,
+        "routeID": ROUTE_ID,
+        "sessionID": SESSION_ID,
+        "permissionRequestID": PERMISSION_ID,
     }
     assert event["resolution"] == "approve"
     assert event["confirmationCapability"] == "local-capability"
@@ -262,7 +414,7 @@ def test_approval_subscribe_rejects_extra_acknowledgement_result_fields(tmp_path
 
     with unix_server(tmp_path, handler) as path:
         event = ParentPolicyClient(path).subscribe_approval(
-            "pending-1", "route-1", "session-1", "permission-1"
+            PENDING_ID, ROUTE_ID, SESSION_ID, PERMISSION_ID
         )
 
     assert event is None
@@ -283,7 +435,7 @@ def test_approval_subscribe_rejects_invalid_expiry_bounds(tmp_path, expiry):
 
     with unix_server(tmp_path, handler) as path:
         event = ParentPolicyClient(path).subscribe_approval(
-            "pending-1", "route-1", "session-1", "permission-1"
+            PENDING_ID, ROUTE_ID, SESSION_ID, PERMISSION_ID
         )
 
     assert event is None
@@ -313,7 +465,68 @@ def test_approval_mismatch_denial_disconnect_and_bad_ack_return_none(tmp_path, m
 
     with unix_server(tmp_path, handler) as path:
         event = ParentPolicyClient(path, timeout=0.1).subscribe_approval(
-            "pending-1", "route-1", "session-1", "permission-1"
+            PENDING_ID, ROUTE_ID, SESSION_ID, PERMISSION_ID
         )
 
+    assert event is None
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["pendingApprovalID", "routeID", "sessionID", "permissionRequestID"],
+)
+@pytest.mark.parametrize("kind", ["malformed", "noncanonical"])
+def test_approval_rejects_invalid_input_correlation_uuid_before_connect(
+    monkeypatch, field, kind
+):
+    values = {
+        "pendingApprovalID": PENDING_ID,
+        "routeID": ROUTE_ID,
+        "sessionID": SESSION_ID,
+        "permissionRequestID": PERMISSION_ID,
+    }
+    values[field] = "not-a-uuid" if kind == "malformed" else values[field].upper()
+    client = ParentPolicyClient("/private/tmp/policy.sock")
+    monkeypatch.setattr(
+        client, "_connect", lambda: pytest.fail("invalid UUID must not connect")
+    )
+    assert client.subscribe_approval(*values.values()) is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("eventID", "not-a-uuid"),
+        ("eventID", EVENT_ID.upper()),
+        ("pendingApprovalID", PENDING_ID.upper()),
+        ("routeID", ROUTE_ID.upper()),
+        ("sessionID", SESSION_ID.upper()),
+        ("permissionRequestID", PERMISSION_ID.upper()),
+    ],
+)
+def test_approval_rejects_malformed_or_noncanonical_event_uuid(tmp_path, field, value):
+    def handler(request, connection):
+        send_frame(connection, approval_ack(request))
+        send_frame(connection, approval_event(request, **{field: value}))
+
+    with unix_server(tmp_path, handler) as path:
+        event = ParentPolicyClient(path).subscribe_approval(
+            PENDING_ID, ROUTE_ID, SESSION_ID, PERMISSION_ID
+        )
+    assert event is None
+
+
+def test_approval_rejects_non_rfc3339_acknowledgement_timestamp(tmp_path):
+    def handler(request, connection):
+        acknowledgement = approval_ack(request)
+        acknowledgement["result"]["expiresAt"] = (
+            (datetime.now(UTC) + timedelta(seconds=30)).isoformat().replace("T", " ")
+        )
+        send_frame(connection, acknowledgement)
+        send_frame(connection, approval_event(request))
+
+    with unix_server(tmp_path, handler) as path:
+        event = ParentPolicyClient(path).subscribe_approval(
+            PENDING_ID, ROUTE_ID, SESSION_ID, PERMISSION_ID
+        )
     assert event is None

@@ -1,16 +1,25 @@
 import json
 import os
 import socket
+import stat
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
+
+from deskpilot_hermes.validation import (
+    nonempty_string,
+    validate_bounded_future,
+    validate_uuid,
+)
 
 
 _PROTOCOL = "deskpilot.policy"
 _VERSION = 1
 _MAX_FRAME = 262_144
 _RESPONSE_BASE_FIELDS = {"protocol", "version", "requestID"}
+_EXECUTE_FIELDS = {"execute", "consumptionID", "ruleID", "reason"}
 
 
 @dataclass(frozen=True)
@@ -21,7 +30,20 @@ class PolicyReply:
 
     @property
     def allowed(self) -> bool:
-        return self.result is not None and self.result.get("execute") is not False
+        result = self.result
+        if not isinstance(result, dict) or set(result) != _EXECUTE_FIELDS:
+            return False
+        if result["execute"] is not True:
+            return False
+        if not nonempty_string(result["ruleID"]) or not nonempty_string(
+            result["reason"]
+        ):
+            return False
+        try:
+            validate_uuid(result["consumptionID"])
+        except (TypeError, ValueError):
+            return False
+        return True
 
 
 def _read_frame(peer: socket.socket) -> dict[str, Any]:
@@ -82,8 +104,66 @@ class ParentPolicyClient:
         self.path = path or os.environ.get("DESKPILOT_POLICY_SOCKET", "")
         self.timeout = timeout
 
-    def call(self, method: str, params: dict[str, Any]) -> PolicyReply:
+    def _socket_path(self) -> Path | None:
         if not self.path or "://" in self.path:
+            return None
+        path = Path(self.path)
+        return path if path.is_absolute() else None
+
+    @staticmethod
+    def _validate_private_ancestors(path: Path) -> None:
+        boundary = Path(os.environ.get("HOME", "")) / ".deskpilot"
+        try:
+            path.relative_to(boundary)
+        except ValueError:
+            return
+        current = path.parent
+        while True:
+            metadata = current.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise PermissionError("private socket ancestor must be a directory")
+            if (
+                metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) & 0o077
+            ):
+                raise PermissionError("private socket ancestor permissions invalid")
+            if current == boundary:
+                return
+            if boundary not in current.parents:
+                raise PermissionError("private socket ancestor escaped boundary")
+            current = current.parent
+
+    @classmethod
+    def _validate_endpoint(cls, path: Path) -> os.stat_result:
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISSOCK(metadata.st_mode):
+            raise PermissionError("policy endpoint must be a socket, not a symlink")
+        if metadata.st_uid != os.geteuid():
+            raise PermissionError("policy socket owner mismatch")
+        if stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise PermissionError("policy socket mode must be 0600")
+        cls._validate_private_ancestors(path)
+        return metadata
+
+    def _connect(self) -> socket.socket:
+        path = self._socket_path()
+        if path is None:
+            raise ValueError("absolute local policy socket required")
+        before = self._validate_endpoint(path)
+        peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            peer.settimeout(self.timeout)
+            peer.connect(str(path))
+            after = self._validate_endpoint(path)
+            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                raise PermissionError("policy socket changed during connect")
+            return peer
+        except BaseException:
+            peer.close()
+            raise
+
+    def call(self, method: str, params: dict[str, Any]) -> PolicyReply:
+        if self._socket_path() is None:
             return PolicyReply(
                 None, "policy.socket_required", "Unix policy socket required"
             )
@@ -96,12 +176,12 @@ class ParentPolicyClient:
             "params": params,
         }
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
-                peer.settimeout(self.timeout)
-                peer.connect(self.path)
-                peer.sendall(
-                    json.dumps(request, separators=(",", ":")).encode() + b"\n"
-                )
+            payload = (
+                json.dumps(request, separators=(",", ":"), allow_nan=False).encode()
+                + b"\n"
+            )
+            with self._connect() as peer:
+                peer.sendall(payload)
                 response = _read_frame(peer)
             result, error = _validate_response(response, request_id)
             if error is None:
@@ -116,6 +196,7 @@ class ParentPolicyClient:
             TimeoutError,
             ValueError,
             KeyError,
+            TypeError,
             json.JSONDecodeError,
         ) as exc:
             return PolicyReply(None, "policy.transport_denied", type(exc).__name__)
@@ -127,7 +208,12 @@ class ParentPolicyClient:
         session_id: str,
         permission_id: str,
     ) -> dict[str, Any] | None:
-        if not self.path or "://" in self.path:
+        if self._socket_path() is None:
+            return None
+        try:
+            for value in (pending_id, route_id, session_id, permission_id):
+                validate_uuid(value)
+        except (TypeError, ValueError):
             return None
         request_id = str(uuid4())
         params = {
@@ -144,9 +230,7 @@ class ParentPolicyClient:
             "params": params,
         }
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
-                peer.settimeout(self.timeout)
-                peer.connect(self.path)
+            with self._connect() as peer:
                 peer.sendall(
                     json.dumps(request, separators=(",", ":")).encode() + b"\n"
                 )
@@ -165,15 +249,9 @@ class ParentPolicyClient:
                         return None
                     if result.get("pendingApprovalID") != pending_id:
                         return None
-                    expires_at = result["expiresAt"]
-                    if not isinstance(expires_at, str):
-                        return None
-                    expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
-                    if expires.tzinfo is None:
-                        raise ValueError("expiry must include timezone")
+                    validate_uuid(result.get("pendingApprovalID"))
+                    expires = validate_bounded_future(result["expiresAt"])
                     remaining = (expires - datetime.now(UTC)).total_seconds()
-                    if remaining <= 0.0 or remaining > 300.0:
-                        return None
                     peer.settimeout(remaining + 2.0)
                     frame = _read_stream_frame(stream)
 
@@ -200,6 +278,14 @@ class ParentPolicyClient:
                 return None
             if event.get("type") != "approval.resolved":
                 return None
+            validate_uuid(event.get("eventID"))
+            for field in (
+                "pendingApprovalID",
+                "routeID",
+                "sessionID",
+                "permissionRequestID",
+            ):
+                validate_uuid(event.get(field))
             actual = (
                 event.get("pendingApprovalID"),
                 event.get("routeID"),

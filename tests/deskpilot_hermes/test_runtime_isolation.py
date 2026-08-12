@@ -1,4 +1,5 @@
 from pathlib import Path
+from runpy import run_path
 
 
 def test_parent_and_hermes_are_distinct_regular_packages():
@@ -29,3 +30,16 @@ def test_hermes_does_not_duplicate_parent_action_registry():
 
     assert ActionRegistry.__module__ == "deskpilot.actions"
     assert not hasattr(deskpilot_hermes, "ActionRegistry")
+
+
+def test_parent_wheel_prerequisite_has_an_actionable_collection_guard():
+    test_dir = Path(__file__).resolve().parent
+    readme = (test_dir / "README.md").read_text()
+    guard = (test_dir / "conftest.py").read_text()
+    install = (
+        ".venv/bin/python -m pip install --no-deps --force-reinstall "
+        "/private/tmp/deskpilot-parent-wheel/deskpilot-0.1.0-py3-none-any.whl"
+    )
+    assert install in readme
+    assert run_path(str(test_dir / "conftest.py"))["_INSTALL"] == install
+    assert 'find_spec("deskpilot")' in guard

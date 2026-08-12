@@ -1,13 +1,19 @@
 import hashlib
+import inspect
 import json
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Any, Callable
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 from deskpilot_hermes.policy import ParentPolicyClient, PolicyReply
 from deskpilot_hermes.provenance import DeskPilotProvenance, require_provenance
+from deskpilot_hermes.validation import (
+    nonempty_string,
+    validate_bounded_future,
+    validate_sha256,
+    validate_uuid,
+)
 
 
 TELEGRAM = re.compile(r"^[1-9][0-9]*$")
@@ -67,11 +73,6 @@ _DECISION_FIELDS = {"risk", "verdict", "ruleID", "reason"}
 _RISKS = {"observe", "reversible_local", "mutation", "sensitive", "prohibited"}
 _VERDICTS = {"allow", "ask", "local_confirm", "deny"}
 _EXECUTE_FIELDS = {"execute", "consumptionID", "ruleID", "reason"}
-_ACTION_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
-_RFC3339 = re.compile(
-    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
-    r"(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
-)
 _ADMISSION_FIELDS = {
     "admitted",
     "ruleID",
@@ -94,28 +95,36 @@ def _denied(rule_id: str, reason: str) -> tuple[None, PolicyReply]:
     return None, PolicyReply(None, rule_id, reason)
 
 
+def _canonical_arguments(arguments: dict[str, Any]) -> str:
+    return json.dumps(arguments, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _invoker_mode(invoke: Callable[..., Any]) -> int | None:
+    try:
+        parameters = inspect.signature(invoke)
+    except (TypeError, ValueError):
+        return None
+    try:
+        parameters.bind({})
+        return 1
+    except (TypeError, ValueError):
+        try:
+            parameters.bind()
+            return 0
+        except (TypeError, ValueError):
+            return None
+
+
 def _nonempty_string(value: Any) -> bool:
-    return isinstance(value, str) and bool(value)
+    return nonempty_string(value)
 
 
 def _validate_action_digest(value: Any) -> None:
-    if not isinstance(value, str) or _ACTION_DIGEST.fullmatch(value) is None:
-        raise ValueError("action digest must be canonical SHA-256")
+    validate_sha256(value)
 
 
 def _validate_uuid(value: Any) -> None:
-    if not _nonempty_string(value):
-        raise ValueError("UUID must be a nonempty string")
-    UUID(value)
-
-
-def _validate_rfc3339(value: Any) -> datetime:
-    if not isinstance(value, str) or _RFC3339.fullmatch(value) is None:
-        raise ValueError("expiry must be RFC3339")
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if parsed.tzinfo is None:
-        raise ValueError("expiry must include a timezone")
-    return parsed
+    validate_uuid(value)
 
 
 def _validate_admission_result(
@@ -137,8 +146,8 @@ def _validate_admission_result(
     if admitted:
         if not _nonempty_string(admission_id) or not _nonempty_string(principal):
             raise ValueError("successful admission identity required")
-        if _validate_rfc3339(expires_at) <= datetime.now(UTC):
-            raise ValueError("admission already expired")
+        _validate_uuid(admission_id)
+        validate_bounded_future(expires_at)
         return admission_id
     if any(value is not None for value in (admission_id, principal, expires_at)):
         raise ValueError("denied admission must not carry admission state")
@@ -174,9 +183,7 @@ def _validate_authorization_result(result: Any) -> tuple[dict[str, Any], str]:
     else:
         _validate_action_digest(action_digest)
         _validate_uuid(pending_id)
-        remaining = (_validate_rfc3339(expires_at) - datetime.now(UTC)).total_seconds()
-        if remaining <= 0.0 or remaining > 300.0:
-            raise ValueError("pending authorization expiry out of bounds")
+        validate_bounded_future(expires_at)
     return decision, verdict
 
 
@@ -299,9 +306,16 @@ def guarded_tool_call(
     admitted: AdmittedRequest,
     tool_name: str,
     arguments: dict[str, Any],
-    invoke: Callable[[], Any],
+    invoke: Callable[..., Any],
     await_local_approval: Callable[[dict[str, Any]], str | None],
 ) -> tuple[Any | None, PolicyReply]:
+    """Deprecated private bridge pending the typed Task 11 dispatcher.
+
+    One-argument invokers receive a fresh copy of the authorized inputs. The
+    zero-argument form remains solely for legacy plan tests; arity validation
+    cannot prove what an unrelated closure captures, so production seams must
+    not import this helper.
+    """
     try:
         current = require_provenance()
     except PermissionError:
@@ -313,6 +327,25 @@ def guarded_tool_call(
         return _denied("policy.unmapped_tool", "tool has no DeskPilot action")
     if not isinstance(arguments, dict):
         return _denied("policy.invalid_arguments", "tool arguments must be an object")
+    try:
+        _validate_uuid(admitted.admission_id)
+    except (TypeError, ValueError):
+        return _denied("policy.invalid_admission", "admission ID must be canonical")
+    invoker_mode = _invoker_mode(invoke)
+    if invoker_mode is None:
+        return _denied(
+            "policy.invalid_invoker", "invoker must accept zero or one input"
+        )
+    try:
+        canonical_arguments = _canonical_arguments(arguments)
+    except (TypeError, ValueError):
+        return _denied("policy.invalid_arguments", "tool arguments must be strict JSON")
+
+    def arguments_unchanged() -> bool:
+        try:
+            return _canonical_arguments(arguments) == canonical_arguments
+        except (TypeError, ValueError):
+            return False
 
     action_id, version = mapping
     try:
@@ -323,7 +356,7 @@ def guarded_tool_call(
                 "traceID": admitted.provenance.trace_id,
                 "actionID": action_id,
                 "actionVersion": version,
-                "inputs": arguments,
+                "inputs": json.loads(canonical_arguments),
             },
         )
         if not isinstance(authorization, PolicyReply):
@@ -332,6 +365,7 @@ def guarded_tool_call(
             return None, authorization
         result = authorization.result
         decision, verdict = _validate_authorization_result(result)
+        action_digest = result["actionDigest"]
         if verdict == "deny":
             return _denied(decision["ruleID"], decision["reason"])
         if verdict == "local_confirm" and admitted.provenance.entry_point != "ui":
@@ -341,15 +375,19 @@ def guarded_tool_call(
 
         capability = None
         if verdict in {"ask", "local_confirm"}:
-            capability = await_local_approval(result)
+            capability = await_local_approval(
+                json.loads(json.dumps(result, separators=(",", ":")))
+            )
             if not isinstance(capability, str) or not capability:
                 return _denied("policy.approval_denied", "local approval unavailable")
+        if not arguments_unchanged():
+            return _denied("policy.arguments_changed", "tool arguments changed")
         grant = client.call(
             "execute",
             {
                 "admissionID": admitted.admission_id,
                 "traceID": admitted.provenance.trace_id,
-                "actionDigest": result["actionDigest"],
+                "actionDigest": action_digest,
                 "confirmationCapability": capability,
             },
         )
@@ -364,4 +402,8 @@ def guarded_tool_call(
     except Exception as exc:
         return _denied("policy.transport_denied", type(exc).__name__)
 
+    if not arguments_unchanged():
+        return _denied("policy.arguments_changed", "tool arguments changed")
+    if invoker_mode == 1:
+        return invoke(json.loads(canonical_arguments)), grant
     return invoke(), grant
