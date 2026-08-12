@@ -59,6 +59,22 @@ def _functions(definitions):
     }
 
 
+def _replace_registry_entry(entry, schema):
+    registry.register(
+        name=entry.name,
+        toolset=entry.toolset,
+        schema=schema,
+        handler=entry.handler,
+        check_fn=entry.check_fn,
+        requires_env=entry.requires_env,
+        is_async=entry.is_async,
+        description=entry.description,
+        emoji=entry.emoji,
+        max_result_size_chars=entry.max_result_size_chars,
+        dynamic_schema_overrides=entry.dynamic_schema_overrides,
+    )
+
+
 def test_builtin_discovery_registers_exact_closed_deskpilot_surface(monkeypatch):
     monkeypatch.setenv("DESKPILOT_MODE", "1")
     imported = discover_builtin_tools()
@@ -86,7 +102,7 @@ def test_visible_definitions_copy_parent_schemas_and_identify_actions(monkeypatc
     for tool_name, (action_id, action_version) in TOOL_ACTIONS.items():
         function = functions[tool_name]
         assert function["description"] == (
-            f"Authorized DeskPilot action {action_id}@{action_version}."
+            f"Execute authorized DeskPilot action {action_id}@{action_version}."
         )
         assert function["parameters"] == specs[(action_id, action_version)].inputSchema
         assert (
@@ -574,6 +590,92 @@ def test_central_model_boundary_rejects_deskpilot_definition_drift(
         _reset_definition_caches()
 
 
+@pytest.mark.parametrize(
+    "tampering",
+    [
+        "parameters",
+        "scalar_type",
+        "container_type",
+        "nonfinite_number",
+        "description",
+        "function_field",
+    ],
+)
+def test_central_model_boundary_rejects_replaced_deskpilot_contract(
+    monkeypatch, tampering
+):
+    monkeypatch.setenv("DESKPILOT_MODE", "1")
+    tool_name = next(iter(TOOL_ACTIONS))
+    original = registry.get_entry(tool_name)
+    assert original is not None
+    altered_schema = copy.deepcopy(original.schema)
+    if tampering == "parameters":
+        altered_schema["parameters"]["unexpected"] = True
+    elif tampering == "scalar_type":
+        altered_schema["parameters"]["additionalProperties"] = 0
+    elif tampering == "container_type":
+        altered_schema["parameters"]["required"] = tuple(
+            altered_schema["parameters"]["required"]
+        )
+    elif tampering == "nonfinite_number":
+        altered_schema["parameters"]["unexpected"] = float("nan")
+    elif tampering == "description":
+        altered_schema["description"] = "Execute an unauthorized replacement."
+    else:
+        altered_schema["unexpected"] = True
+
+    _replace_registry_entry(original, altered_schema)
+    _reset_definition_caches()
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="^DeskPilot tool definitions do not match authorized actions$",
+        ):
+            model_tools.get_tool_definitions(
+                enabled_toolsets=["deskpilot"],
+                quiet_mode=True,
+            )
+    finally:
+        _replace_registry_entry(original, original.schema)
+        _reset_definition_caches()
+
+
+def test_central_model_boundary_rejects_unexpected_top_level_definition_field(
+    monkeypatch,
+):
+    monkeypatch.setenv("DESKPILOT_MODE", "1")
+    _reset_definition_caches()
+    original_get_definitions = registry.get_definitions
+
+    def add_top_level_field(*args, **kwargs):
+        definitions = original_get_definitions(*args, **kwargs)
+        definitions[0]["unexpected"] = True
+        return definitions
+
+    monkeypatch.setattr(registry, "get_definitions", add_top_level_field)
+
+    with pytest.raises(
+        RuntimeError,
+        match="^DeskPilot tool definitions do not match authorized actions$",
+    ):
+        model_tools.get_tool_definitions(
+            enabled_toolsets=["deskpilot"],
+            quiet_mode=True,
+        )
+
+
+def test_expected_deskpilot_definition_contract_returns_deep_copies():
+    module = importlib.import_module("tools.deskpilot_actions_tool")
+
+    first = module.get_expected_deskpilot_definitions()
+    tool_name = next(iter(first))
+    first[tool_name]["function"]["parameters"]["poisoned"] = True
+
+    second = module.get_expected_deskpilot_definitions()
+
+    assert "poisoned" not in second[tool_name]["function"]["parameters"]
+
+
 def test_deskpilot_definition_cache_is_detached_and_revalidated(monkeypatch):
     monkeypatch.setenv("DESKPILOT_MODE", "1")
     _reset_definition_caches()
@@ -596,6 +698,55 @@ def test_deskpilot_definition_cache_is_detached_and_revalidated(monkeypatch):
     assert all(
         "poisoned" not in definition["function"]["parameters"] for definition in second
     )
+
+
+def test_deskpilot_definition_cache_rejects_deep_contract_corruption(monkeypatch):
+    monkeypatch.setenv("DESKPILOT_MODE", "1")
+    _reset_definition_caches()
+    model_tools.get_tool_definitions(
+        enabled_toolsets=["deskpilot"],
+        quiet_mode=True,
+    )
+    cached = next(iter(model_tools._tool_defs_cache.values()))
+    cached[0]["function"]["description"] = "Corrupted cached description."
+
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="^DeskPilot tool definitions do not match authorized actions$",
+        ):
+            model_tools.get_tool_definitions(
+                enabled_toolsets=["deskpilot"],
+                quiet_mode=True,
+            )
+    finally:
+        _reset_definition_caches()
+
+
+def test_fresh_deskpilot_definitions_are_detached_when_sanitizer_fails(monkeypatch):
+    monkeypatch.setenv("DESKPILOT_MODE", "1")
+    monkeypatch.setattr(
+        "tools.schema_sanitizer.sanitize_tool_schemas",
+        lambda _definitions: (_ for _ in ()).throw(RuntimeError("sanitizer failed")),
+    )
+    _reset_definition_caches()
+    tool_name = next(iter(TOOL_ACTIONS))
+    entry = registry.get_entry(tool_name)
+    assert entry is not None
+    original_parameters = copy.deepcopy(entry.schema["parameters"])
+
+    try:
+        definitions = model_tools.get_tool_definitions(
+            enabled_toolsets=["deskpilot"],
+            quiet_mode=False,
+        )
+        functions = _functions(definitions)
+        functions[tool_name]["parameters"]["poisoned"] = True
+
+        assert entry.schema["parameters"] == original_parameters
+    finally:
+        entry.schema["parameters"] = original_parameters
+        _reset_definition_caches()
 
 
 def test_actual_acp_agent_selection_fails_closed_at_model_boundary(monkeypatch):

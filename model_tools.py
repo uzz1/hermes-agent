@@ -22,6 +22,7 @@ Public API (signatures preserved from the original 2,400-line version):
 
 import os
 import json
+import math
 import re
 import asyncio
 import copy
@@ -288,13 +289,58 @@ def _validate_deskpilot_tool_selection(
     return True
 
 
-def _validate_deskpilot_definition_names(definitions: List[Dict[str, Any]]) -> None:
-    """Require the model-visible DeskPilot names to match its authorized actions."""
-    from deskpilot_hermes.integration import TOOL_ACTIONS
+def _validate_closed_deskpilot_definitions(
+    definitions: List[Dict[str, Any]],
+) -> None:
+    """Require exact parent-derived definitions for the closed DeskPilot surface."""
+    from tools.deskpilot_actions_tool import get_expected_deskpilot_definitions
 
-    names = {definition.get("function", {}).get("name") for definition in definitions}
-    if names != set(TOOL_ACTIONS) or len(definitions) != len(TOOL_ACTIONS):
+    expected = get_expected_deskpilot_definitions()
+    if len(definitions) != len(expected):
         raise RuntimeError(_DESKPILOT_DEFINITION_ERROR)
+
+    seen_names = set()
+    for definition in definitions:
+        if type(definition) is not dict or set(definition) != {"type", "function"}:
+            raise RuntimeError(_DESKPILOT_DEFINITION_ERROR)
+        function = definition.get("function")
+        if type(function) is not dict or not _is_exact_json_value(definition):
+            raise RuntimeError(_DESKPILOT_DEFINITION_ERROR)
+        name = function.get("name")
+        try:
+            definition_json = json.dumps(
+                definition, sort_keys=True, separators=(",", ":"), allow_nan=False
+            )
+            expected_json = json.dumps(
+                expected.get(name),
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError):
+            raise RuntimeError(_DESKPILOT_DEFINITION_ERROR) from None
+        if name in seen_names or definition_json != expected_json:
+            raise RuntimeError(_DESKPILOT_DEFINITION_ERROR)
+        seen_names.add(name)
+
+    if seen_names != set(expected):
+        raise RuntimeError(_DESKPILOT_DEFINITION_ERROR)
+
+
+def _is_exact_json_value(value: object) -> bool:
+    """Reject Python containers/scalars that JSON encoding would normalize."""
+    if value is None or type(value) in {str, bool, int}:
+        return True
+    if type(value) is float:
+        return math.isfinite(value)
+    if type(value) is list:
+        return all(_is_exact_json_value(item) for item in value)
+    if type(value) is dict:
+        return all(
+            type(key) is str and _is_exact_json_value(item)
+            for key, item in value.items()
+        )
+    return False
 
 
 def _clear_tool_defs_cache() -> None:
@@ -360,7 +406,7 @@ def get_tool_definitions(
         cached = _tool_defs_cache.get(cache_key)
         if cached is not None:
             if deskpilot_closed_surface:
-                _validate_deskpilot_definition_names(cached)
+                _validate_closed_deskpilot_definitions(cached)
             # Update _last_resolved_tool_names so downstream callers see
             # consistent state even on a cache hit.
             global _last_resolved_tool_names
@@ -468,7 +514,7 @@ def _compute_tool_definitions(
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
     if deskpilot_closed_surface:
-        _validate_deskpilot_definition_names(filtered_tools)
+        _validate_closed_deskpilot_definitions(filtered_tools)
 
     # The set of tool names that actually passed check_fn filtering.
     # Use this (not tools_to_include) for any downstream schema that references
@@ -594,6 +640,9 @@ def _compute_tool_definitions(
     except Exception as e:  # pragma: no cover — never break tool loading
         logger.warning("Tool search assembly skipped: %s", e)
 
+    if deskpilot_closed_surface:
+        _validate_closed_deskpilot_definitions(filtered_tools)
+        return copy.deepcopy(filtered_tools)
     return filtered_tools
 
 

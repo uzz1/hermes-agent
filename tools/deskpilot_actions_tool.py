@@ -6,6 +6,7 @@ public policy wrapper before the typed dispatcher can reach any adapter.
 """
 
 import copy
+import json
 import os
 from collections.abc import Mapping
 from typing import Any
@@ -51,7 +52,7 @@ def _prepare_registrations(
             "schema": {
                 "name": tool_name,
                 "description": (
-                    f"Authorized DeskPilot action {action_id}@{action_version}."
+                    f"Execute authorized DeskPilot action {action_id}@{action_version}."
                 ),
                 "parameters": copy.deepcopy(spec.inputSchema),
             },
@@ -59,6 +60,22 @@ def _prepare_registrations(
             "check_fn": _deskpilot_mode_enabled,
         })
     return registrations
+
+
+def _expected_definitions_json(registrations: list[dict[str, Any]]) -> str:
+    definitions = {
+        registration["name"]: {
+            "type": "function",
+            "function": copy.deepcopy(registration["schema"]),
+        }
+        for registration in registrations
+    }
+    return json.dumps(definitions, sort_keys=True, separators=(",", ":"))
+
+
+def get_expected_deskpilot_definitions() -> dict[str, dict[str, Any]]:
+    """Return a detached copy of the parent-derived model definition contract."""
+    return json.loads(_EXPECTED_DEFINITIONS_JSON)
 
 
 def _register_deskpilot_tools(
@@ -76,6 +93,7 @@ def _register_deskpilot_tools(
 # AST filter recognizes this module. All parent data is loaded and validated
 # before the first registration, preserving atomicity on registry mismatch.
 _REGISTRATIONS = _prepare_registrations(_packaged_action_specs())
+_EXPECTED_DEFINITIONS_JSON = _expected_definitions_json(_REGISTRATIONS)
 _FIRST_REGISTRATION, *_REMAINING_REGISTRATIONS = _REGISTRATIONS
 registry.register(**_FIRST_REGISTRATION)
 for _registration in _REMAINING_REGISTRATIONS:
