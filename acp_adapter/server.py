@@ -11,6 +11,7 @@ import logging
 import os
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Deque, Optional
 from urllib.parse import unquote, urlparse
@@ -518,11 +519,16 @@ class HermesACPAgent(acp.Agent):
         super().__init__()
         self.session_manager = session_manager or SessionManager()
         self._conn: Optional[acp.Client] = None
+        from deskpilot_hermes.acp_permissions import ACPPermissionBridge
+
+        self._deskpilot_permission_bridge = ACPPermissionBridge()
 
     # ---- Connection lifecycle -----------------------------------------------
 
     def on_connect(self, conn: acp.Client) -> None:
         """Store the client connection for sending session updates."""
+        if os.environ.get("DESKPILOT_MODE") == "1":
+            self._deskpilot_permission_bridge.connect(conn)
         self._conn = conn
         logger.info("ACP client connected")
 
@@ -791,6 +797,8 @@ class HermesACPAgent(acp.Agent):
         mcp_servers: list[McpServerStdio | McpServerHttp | McpServerSse] | None,
     ) -> None:
         """Register ACP-provided MCP servers and refresh the agent tool surface."""
+        if os.environ.get("DESKPILOT_MODE") == "1":
+            return
         if not mcp_servers:
             return
 
@@ -1131,7 +1139,7 @@ class HermesACPAgent(acp.Agent):
         mcp_servers: list | None = None,
         **kwargs: Any,
     ) -> LoadSessionResponse | None:
-        state = self.session_manager.update_cwd(session_id, cwd)
+        state = self.session_manager.reacquire_session(session_id, cwd)
         if state is None:
             logger.warning("load_session: session %s not found", session_id)
             return None
@@ -1178,7 +1186,7 @@ class HermesACPAgent(acp.Agent):
         mcp_servers: list | None = None,
         **kwargs: Any,
     ) -> ResumeSessionResponse:
-        state = self.session_manager.update_cwd(session_id, cwd)
+        state = self.session_manager.reacquire_session(session_id, cwd)
         if state is None:
             logger.warning("resume_session: session %s not found, creating new", session_id)
             state = self.session_manager.create_session(cwd=cwd)
@@ -1208,6 +1216,7 @@ class HermesACPAgent(acp.Agent):
 
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
         state = self.session_manager.get_session(session_id)
+        self._deskpilot_permission_bridge.cancel_session(session_id)
         if state and state.cancel_event:
             with state.runtime_lock:
                 if state.is_running and state.current_prompt_text:
@@ -1219,6 +1228,19 @@ class HermesACPAgent(acp.Agent):
             except Exception:
                 logger.debug("Failed to interrupt ACP session %s", session_id, exc_info=True)
             logger.info("Cancelled session %s", session_id)
+        admitted = getattr(state, "admitted_request", None) if state else None
+        if os.environ.get("DESKPILOT_MODE") == "1" and admitted is not None:
+            from deskpilot_hermes.policy import ParentPolicyClient
+
+            await asyncio.to_thread(
+                ParentPolicyClient().call,
+                "cancel",
+                {
+                    "admissionID": admitted.admission_id,
+                    "traceID": admitted.provenance.trace_id,
+                    "reason": "acp.session_cancelled",
+                },
+            )
 
     async def fork_session(
         self,
@@ -1313,6 +1335,16 @@ class HermesACPAgent(acp.Agent):
         )
         if not has_content:
             return PromptResponse(stop_reason="end_turn")
+
+        try:
+            admitted_request = self.session_manager.refresh_prompt_admission(state)
+        except Exception:
+            logger.warning(
+                "DeskPilot prompt admission denied for session %s",
+                session_id,
+                exc_info=True,
+            )
+            return PromptResponse(stop_reason="refusal")
 
         # /steer on an idle session has no in-flight tool call to inject into.
         # Rewrite it so the payload runs as a normal user prompt, matching the
@@ -1413,6 +1445,11 @@ class HermesACPAgent(acp.Agent):
                 message_cb(text)
 
             approval_cb = make_approval_callback(conn.request_permission, loop, session_id)
+            deskpilot_permission_requester = (
+                self._deskpilot_permission_bridge.requester(conn, loop, session_id)
+                if os.environ.get("DESKPILOT_MODE") == "1"
+                else None
+            )
             try:
                 from acp_adapter.edit_approval import make_acp_edit_approval_requester
 
@@ -1430,6 +1467,7 @@ class HermesACPAgent(acp.Agent):
             step_cb = None
             stream_delta_cb = None
             approval_cb = None
+            deskpilot_permission_requester = None
 
         agent = state.agent
         agent.tool_progress_callback = tool_progress_cb
@@ -1458,6 +1496,49 @@ class HermesACPAgent(acp.Agent):
 
         def _run_agent() -> dict:
             nonlocal previous_approval_cb, previous_interactive, edit_approval_token, previous_session_id
+            deskpilot_context = ExitStack()
+            try:
+                if os.environ.get("DESKPILOT_MODE") == "1":
+                    from deskpilot_hermes.provenance import provenance
+                    from deskpilot_hermes.runtime_context import (
+                        reset_admitted_request,
+                        reset_permission_requester,
+                        reset_tool_dispatcher,
+                        reset_trusted_user_request,
+                        set_admitted_request,
+                        set_permission_requester,
+                        set_tool_dispatcher,
+                        set_trusted_user_request,
+                    )
+
+                    admitted_token = set_admitted_request(admitted_request)
+                    deskpilot_context.callback(
+                        reset_admitted_request, admitted_token
+                    )
+                    trusted_request_token = set_trusted_user_request(
+                        user_text or "[Image attachment]"
+                    )
+                    deskpilot_context.callback(
+                        reset_trusted_user_request, trusted_request_token
+                    )
+                    if state.tool_dispatcher is not None:
+                        dispatcher_token = set_tool_dispatcher(state.tool_dispatcher)
+                        deskpilot_context.callback(
+                            reset_tool_dispatcher, dispatcher_token
+                        )
+                    if deskpilot_permission_requester is not None:
+                        requester_token = set_permission_requester(
+                            deskpilot_permission_requester
+                        )
+                        deskpilot_context.callback(
+                            reset_permission_requester, requester_token
+                        )
+                    deskpilot_context.enter_context(
+                        provenance(admitted_request.provenance)
+                    )
+            except Exception:
+                deskpilot_context.close()
+                raise
             # Bind HERMES_SESSION_KEY for this session so per-session caches
             # (e.g. the interactive sudo password cache in tools.terminal_tool)
             # scope to the ACP session rather than leaking across sessions
@@ -1511,6 +1592,7 @@ class HermesACPAgent(acp.Agent):
                 logger.exception("Agent error in session %s", session_id)
                 return {"final_response": f"Error: {e}", "messages": state.history}
             finally:
+                deskpilot_context.close()
                 # Restore HERMES_INTERACTIVE.
                 if previous_interactive is None:
                     os.environ.pop("HERMES_INTERACTIVE", None)

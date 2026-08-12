@@ -399,9 +399,10 @@ def test_exact_approval_success_consumes_each_source_once(monkeypatch):
     assert capability == "capability-1"
     request = events[0][1]
     pending = events[1][1]
-    assert set(request) == {"routeID", "pendingApprovalID", "decision"}
+    assert set(request) == {"routeID", "pendingApprovalID", "decision", "expiresAt"}
     assert request["pendingApprovalID"] == PENDING_ID
     assert request["decision"] == authorization()["decision"]
+    assert isinstance(request["expiresAt"], str)
     assert pending.calls[0] == ("wait_emitted", 5.0)
     assert pending.calls[1][0] == "wait"
     assert isinstance(pending.calls[1][1], datetime)

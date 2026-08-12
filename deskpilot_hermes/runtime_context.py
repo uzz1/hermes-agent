@@ -180,6 +180,7 @@ def wait_for_local_approval(authorization: Any) -> str | None:
             "routeID": route_id,
             "pendingApprovalID": pending_id,
             "decision": dict(decision),
+            "expiresAt": expires_at,
         })
         route_id, session_id, permission_id = _validate_pending(pending, route_id)
         if pending.wait_emitted(5.0) is not True:

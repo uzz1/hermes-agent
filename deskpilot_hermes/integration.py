@@ -128,7 +128,7 @@ def _validate_uuid(value: Any) -> None:
 
 
 def _validate_admission_result(
-    result: Any, entry_point: str, sender: str
+    result: Any, entry_point: str, sender: str | None
 ) -> str | None:
     if not isinstance(result, dict) or set(result) != _ADMISSION_FIELDS:
         raise ValueError("admission result shape")
@@ -152,6 +152,35 @@ def _validate_admission_result(
     if any(value is not None for value in (admission_id, principal, expires_at)):
         raise ValueError("denied admission must not carry admission state")
     return None
+
+
+def admit_ui(client: ParentPolicyClient, ui_lease: str) -> AdmittedRequest | None:
+    if not nonempty_string(ui_lease):
+        return None
+    try:
+        reply = client.call(
+            "admit",
+            {
+                "entryPoint": "ui",
+                "sender": None,
+                "uiLease": ui_lease,
+                "jobID": None,
+                "actionID": None,
+                "actionVersion": 1,
+                "inputDigest": None,
+            },
+        )
+    except Exception:
+        return None
+    if not isinstance(reply, PolicyReply):
+        return None
+    try:
+        admission_id = _validate_admission_result(reply.result, "ui", None)
+    except (TypeError, ValueError):
+        return None
+    if admission_id is None:
+        return None
+    return AdmittedRequest(DeskPilotProvenance("ui", None, str(uuid4())), admission_id)
 
 
 def _validate_authorization_result(result: Any) -> tuple[dict[str, Any], str]:

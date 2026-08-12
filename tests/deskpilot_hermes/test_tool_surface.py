@@ -749,7 +749,7 @@ def test_fresh_deskpilot_definitions_are_detached_when_sanitizer_fails(monkeypat
         _reset_definition_caches()
 
 
-def test_actual_acp_agent_selection_fails_closed_at_model_boundary(monkeypatch):
+def test_actual_acp_agent_selection_is_closed_before_model_boundary(monkeypatch):
     from acp_adapter import session as acp_session
 
     captured = {}
@@ -760,7 +760,10 @@ def test_actual_acp_agent_selection_fails_closed_at_model_boundary(monkeypatch):
 
     monkeypatch.setenv("DESKPILOT_MODE", "1")
     monkeypatch.setattr("run_agent.AIAgent", CapturingAgent)
-    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"platform_toolsets": {"acp": ["deskpilot", "no_mcp"]}},
+    )
     monkeypatch.setattr(
         "hermes_cli.runtime_provider.resolve_runtime_provider", lambda **_kwargs: {}
     )
@@ -769,12 +772,12 @@ def test_actual_acp_agent_selection_fails_closed_at_model_boundary(monkeypatch):
 
     manager._make_agent(session_id="acp-session", cwd="/tmp")
 
-    assert captured["enabled_toolsets"] == ["hermes-acp"]
-    with pytest.raises(RuntimeError):
-        model_tools.get_tool_definitions(
-            enabled_toolsets=captured["enabled_toolsets"],
-            quiet_mode=True,
-        )
+    assert captured["enabled_toolsets"] == ["deskpilot"]
+    definitions = model_tools.get_tool_definitions(
+        enabled_toolsets=captured["enabled_toolsets"],
+        quiet_mode=True,
+    )
+    assert {item["function"]["name"] for item in definitions} == DESKPILOT_NAMES
 
 
 def test_actual_cron_fallback_and_per_job_override_fail_closed(monkeypatch):

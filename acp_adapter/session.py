@@ -142,6 +142,11 @@ def _expand_acp_enabled_toolsets(
     mcp_server_names: List[str] | None = None,
 ) -> List[str]:
     """Return ACP toolsets plus explicit MCP server toolsets for this session."""
+    if os.environ.get("DESKPILOT_MODE") == "1":
+        if toolsets != ["deskpilot", "no_mcp"]:
+            raise RuntimeError("DeskPilot ACP requires [deskpilot,no_mcp]")
+        return ["deskpilot"]
+
     expanded: List[str] = []
     for name in list(toolsets or ["hermes-acp"]):
         if name and name not in expanded:
@@ -181,6 +186,8 @@ class SessionState:
     runtime_lock: Any = field(default_factory=Lock)
     current_prompt_text: str = ""
     interrupted_prompt_text: str = ""
+    admitted_request: Any = None
+    tool_dispatcher: Any = None
 
 
 class SessionManager:
@@ -191,7 +198,15 @@ class SessionManager:
     via ``session_search``.
     """
 
-    def __init__(self, agent_factory=None, db=None):
+    def __init__(
+        self,
+        agent_factory=None,
+        db=None,
+        *,
+        deskpilot_policy_client=None,
+        deskpilot_lease_reader=None,
+        deskpilot_tool_dispatcher=None,
+    ):
         """
         Args:
             agent_factory: Optional callable that creates an AIAgent-like object.
@@ -204,6 +219,34 @@ class SessionManager:
         self._lock = Lock()
         self._agent_factory = agent_factory
         self._db_instance = db  # None → lazy-init on first use
+        self._deskpilot_policy_client = deskpilot_policy_client
+        self._deskpilot_lease_reader = deskpilot_lease_reader
+        self._deskpilot_tool_dispatcher = deskpilot_tool_dispatcher
+
+    def _deskpilot_admit_ui(self):
+        if os.environ.get("DESKPILOT_MODE") != "1":
+            return None
+        from deskpilot_hermes.integration import admit_ui
+        from deskpilot_hermes.policy import ParentPolicyClient
+        from deskpilot_hermes.ui_lease import LiveUILeaseReader
+
+        client = self._deskpilot_policy_client or ParentPolicyClient()
+        reader = self._deskpilot_lease_reader or LiveUILeaseReader()
+        try:
+            admitted = admit_ui(client, reader.read())
+        except Exception:
+            admitted = None
+        if admitted is None:
+            raise PermissionError("DeskPilot UI admission denied")
+        return admitted
+
+    def refresh_prompt_admission(self, state: SessionState):
+        """Refresh the non-persisted DeskPilot admission for one model turn."""
+        admitted = self._deskpilot_admit_ui()
+        if os.environ.get("DESKPILOT_MODE") == "1":
+            with state.runtime_lock:
+                state.admitted_request = admitted
+        return admitted
 
     # ---- public API ---------------------------------------------------------
 
@@ -213,6 +256,7 @@ class SessionManager:
 
         cwd = _translate_acp_cwd(cwd)
         session_id = str(uuid.uuid4())
+        admitted_request = self._deskpilot_admit_ui()
         agent = self._make_agent(session_id=session_id, cwd=cwd)
         state = SessionState(
             session_id=session_id,
@@ -220,6 +264,8 @@ class SessionManager:
             cwd=cwd,
             model=getattr(agent, "model", "") or "",
             cancel_event=threading.Event(),
+            admitted_request=admitted_request,
+            tool_dispatcher=self._deskpilot_tool_dispatcher,
         )
         with self._lock:
             self._sessions[session_id] = state
@@ -260,6 +306,7 @@ class SessionManager:
             return None
 
         new_id = str(uuid.uuid4())
+        admitted_request = self._deskpilot_admit_ui()
         agent = self._make_agent(
             session_id=new_id,
             cwd=cwd,
@@ -272,6 +319,8 @@ class SessionManager:
             model=getattr(agent, "model", original.model) or original.model,
             history=copy.deepcopy(original.history),
             cancel_event=threading.Event(),
+            admitted_request=admitted_request,
+            tool_dispatcher=self._deskpilot_tool_dispatcher,
         )
         with self._lock:
             self._sessions[new_id] = state
@@ -364,6 +413,17 @@ class SessionManager:
         _register_task_cwd(session_id, cwd)
         self._persist(state)
         return state
+
+    def reacquire_session(self, session_id: str, cwd: str) -> Optional[SessionState]:
+        """Re-admit an existing session before mutating its cwd or persisted state."""
+        with self._lock:
+            state = self._sessions.get(session_id)
+        if state is None:
+            state = self._restore(session_id)
+            if state is None:
+                return None
+        self.refresh_prompt_admission(state)
+        return self.update_cwd(session_id, cwd)
 
     def cleanup(self) -> None:
         """Remove all sessions (memory and database) and clear task-specific cwd overrides."""
@@ -516,6 +576,7 @@ class SessionManager:
             history = []
 
         try:
+            admitted_request = self._deskpilot_admit_ui()
             agent = self._make_agent(
                 session_id=session_id,
                 cwd=cwd,
@@ -535,6 +596,8 @@ class SessionManager:
             model=model or getattr(agent, "model", "") or "",
             history=history,
             cancel_event=threading.Event(),
+            admitted_request=admitted_request,
+            tool_dispatcher=self._deskpilot_tool_dispatcher,
         )
         with self._lock:
             self._sessions[session_id] = state
@@ -573,6 +636,15 @@ class SessionManager:
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
         config = load_config()
+        if os.environ.get("DESKPILOT_MODE") == "1":
+            from deskpilot_hermes.startup import (
+                build_environment_probes,
+                install_deskpilot_runtime,
+            )
+
+            self._deskpilot_tool_dispatcher = install_deskpilot_runtime(
+                build_environment_probes()
+            )
         model_cfg = config.get("model")
         default_model = ""
         config_provider = None
@@ -588,10 +660,15 @@ class SessionManager:
             if not isinstance(cfg, dict) or cfg.get("enabled", True) is not False
         ]
 
+        if os.environ.get("DESKPILOT_MODE") == "1":
+            configured_toolsets = (config.get("platform_toolsets") or {}).get("acp")
+        else:
+            configured_toolsets = ["hermes-acp"]
+
         kwargs = {
             "platform": "acp",
             "enabled_toolsets": _expand_acp_enabled_toolsets(
-                ["hermes-acp"],
+                configured_toolsets,
                 mcp_server_names=configured_mcp_servers,
             ),
             "quiet_mode": True,
