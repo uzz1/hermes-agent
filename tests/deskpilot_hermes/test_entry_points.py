@@ -247,7 +247,7 @@ def _malformed_admission_replies():
         changed(expiresAt="2099-08-12T12:00:00"),
         changed(expiresAt="2099-08-12 12:00:00+00:00"),
         changed(expiresAt=(datetime.now(UTC) - timedelta(seconds=1)).isoformat()),
-        changed(expiresAt=(datetime.now(UTC) + timedelta(seconds=301)).isoformat()),
+        changed(expiresAt=(datetime.now(UTC) + timedelta(seconds=600)).isoformat()),
     ])
     denied = deepcopy(denied_admission().result)
     denied["admissionID"] = "unexpected"

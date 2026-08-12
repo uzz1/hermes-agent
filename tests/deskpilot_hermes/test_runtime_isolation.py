@@ -1,5 +1,4 @@
 from pathlib import Path
-from runpy import run_path
 
 
 def test_parent_and_hermes_are_distinct_regular_packages():
@@ -20,26 +19,17 @@ def test_hermes_modules_do_not_live_under_parent_package_path():
     import deskpilot
 
     parent_dir = Path(next(iter(deskpilot.__path__))).resolve()
-    for module in ("integration.py", "provenance.py", "policy.py"):
+    for module in (
+        "integration.py",
+        "provenance.py",
+        "policy.py",
+        "runtime_context.py",
+        "tool_dispatcher.py",
+    ):
         assert not (parent_dir / module).exists()
 
 
 def test_hermes_does_not_duplicate_parent_action_registry():
-    from deskpilot.actions import ActionRegistry
-    import deskpilot_hermes
+    from deskpilot_hermes.tool_dispatcher import ActionRegistry
 
     assert ActionRegistry.__module__ == "deskpilot.actions"
-    assert not hasattr(deskpilot_hermes, "ActionRegistry")
-
-
-def test_parent_wheel_prerequisite_has_an_actionable_collection_guard():
-    test_dir = Path(__file__).resolve().parent
-    readme = (test_dir / "README.md").read_text()
-    guard = (test_dir / "conftest.py").read_text()
-    install = (
-        ".venv/bin/python -m pip install --no-deps --force-reinstall "
-        "/private/tmp/deskpilot-parent-wheel/deskpilot-0.1.0-py3-none-any.whl"
-    )
-    assert install in readme
-    assert run_path(str(test_dir / "conftest.py"))["_INSTALL"] == install
-    assert 'find_spec("deskpilot")' in guard

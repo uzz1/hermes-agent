@@ -873,7 +873,7 @@ def _emit_post_tool_call_hook(
         logger.debug("post_tool_call hook error: %s", _hook_err)
 
 
-def handle_function_call(
+def _handle_function_call_unchecked(
     function_name: str,
     function_args: Dict[str, Any],
     task_id: Optional[str] = None,
@@ -1198,6 +1198,75 @@ def handle_function_call(
         error_msg = f"Error executing {function_name}: {str(e)}"
         logger.exception(error_msg)
         return json.dumps({"error": _sanitize_tool_error(error_msg)}, ensure_ascii=False)
+
+
+def handle_function_call(
+    function_name: str,
+    function_args: Dict[str, Any],
+    task_id: Optional[str] = None,
+    tool_call_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    turn_id: Optional[str] = None,
+    api_request_id: Optional[str] = None,
+    user_task: Optional[str] = None,
+    enabled_tools: Optional[List[str]] = None,
+    skip_pre_tool_call_hook: bool = False,
+    skip_tool_request_middleware: bool = False,
+    tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    enabled_toolsets: Optional[List[str]] = None,
+    disabled_toolsets: Optional[List[str]] = None,
+) -> str:
+    if os.environ.get("DESKPILOT_MODE") != "1":
+        return _handle_function_call_unchecked(
+            function_name=function_name,
+            function_args=function_args,
+            task_id=task_id,
+            tool_call_id=tool_call_id,
+            session_id=session_id,
+            turn_id=turn_id,
+            api_request_id=api_request_id,
+            user_task=user_task,
+            enabled_tools=enabled_tools,
+            skip_pre_tool_call_hook=skip_pre_tool_call_hook,
+            skip_tool_request_middleware=skip_tool_request_middleware,
+            tool_request_middleware_trace=tool_request_middleware_trace,
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+        )
+
+    try:
+        from deskpilot_hermes.runtime_context import (
+            require_admitted_request,
+            require_tool_dispatcher,
+        )
+
+        admitted = require_admitted_request()
+        dispatcher = require_tool_dispatcher()
+        observed = dispatcher.dispatch(
+            admitted=admitted,
+            tool_name=function_name,
+            arguments=function_args,
+        )
+        return json.dumps(
+            observed,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except Exception as exc:
+        return json.dumps(
+            {
+                "ok": False,
+                "error": "deskpilot.policy_denied",
+                "_meta": {
+                    "deskpilot": {
+                        "ruleID": "execute.denied",
+                        "reason": type(exc).__name__,
+                    }
+                },
+            },
+            separators=(",", ":"),
+        )
 
 
 # =============================================================================
