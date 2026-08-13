@@ -40,12 +40,16 @@ import sys
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 
+from deskpilot_hermes.status_server import DeskPilotStatusHeartbeat
 from tools.computer_use.backend import (
     ActionResult,
     CaptureResult,
     ComputerUseBackend,
     UIElement,
 )
+# Bound at module scope so the AX adapter is one patchable seam rather than a
+# name resolved inside the accessor.
+from tools.computer_use.cua_backend import CuaDriverBackend
 
 logger = logging.getLogger(__name__)
 
@@ -121,24 +125,53 @@ def _is_blocked_type(text: str) -> Optional[str]:
 # Per-process cached backend; lazily instantiated on first call.
 _backend_lock = threading.Lock()
 _backend: Optional[ComputerUseBackend] = None
+_backend_heartbeat: Optional[DeskPilotStatusHeartbeat] = None
 # Session-scoped approval state.
 _session_auto_approve = False
 _always_allow: set = set()  # action names the user unlocked for the session
 
 
-def _get_backend() -> ComputerUseBackend:
+def _mark_cua_unhealthy(error: BaseException) -> None:
+    """Drop the cached backend once its status heartbeat reports it down."""
     global _backend
+    with _backend_lock:
+        backend = _backend
+        _backend = None
+    if backend is not None:
+        try:
+            backend.stop()
+        except Exception:
+            pass
+
+
+def _get_backend() -> ComputerUseBackend:
+    global _backend, _backend_heartbeat
     with _backend_lock:
         if _backend is None:
             backend_name = os.environ.get("HERMES_COMPUTER_USE_BACKEND", "cua").lower()
             if backend_name in {"cua", "cua-driver", ""}:
-                from tools.computer_use.cua_backend import CuaDriverBackend
                 _backend = CuaDriverBackend()
             elif backend_name == "noop":  # pragma: no cover
                 _backend = _NoopBackend()
             else:
                 raise RuntimeError(f"Unknown HERMES_COMPUTER_USE_BACKEND={backend_name!r}")
             _backend.start()
+            # Availability is proven before anything is published, so "cua ready"
+            # never means merely "we constructed an object".
+            if not _backend.is_available():
+                _backend.stop()
+                _backend = None
+                raise RuntimeError("AX backend not ready")
+            _backend_heartbeat = DeskPilotStatusHeartbeat(
+                "cua", on_unhealthy=_mark_cua_unhealthy
+            )
+            try:
+                _backend_heartbeat.start_after_initialization(enabled=True, ready=True)
+            except BaseException:
+                _backend.stop()
+                _backend = None
+                _backend_heartbeat = None
+                raise
         return _backend
 
 
@@ -313,6 +346,36 @@ def _summarize_action(action: str, args: Dict[str, Any]) -> str:
     return action
 
 
+_AX_INSPECTION_ELEMENT_LIMIT = 100
+
+
+def _bounded_element_text(elements, max_elements: int = _AX_INSPECTION_ELEMENT_LIMIT) -> str:
+    """Flatten on-screen element text into one bounded blob for inspection."""
+    return "\n".join(
+        f"{element.index} {element.role} {element.app} {element.label}".strip()
+        for element in elements[:max_elements]
+    )
+
+
+def _inspect_captured_app_text(cap: CaptureResult) -> None:
+    """Submit captured on-screen text to the policy gate.
+
+    Screen text is attacker-controlled: any window can render an instruction.
+    Nothing derived from a capture reaches the model until the parent policy
+    process has allowed it, so a refusal raises here rather than returning a
+    response the caller might still forward.
+    """
+    if os.environ.get("DESKPILOT_MODE") != "1":
+        return
+    from deskpilot_hermes.policy import ParentPolicyClient
+    from deskpilot_hermes.runtime_context import require_trusted_user_request
+    from deskpilot_hermes.untrusted_ingress import ingest_app_text
+
+    ingest_app_text(
+        ParentPolicyClient(), _bounded_element_text(cap.elements), require_trusted_user_request()
+    )
+
+
 def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) -> Any:
     capture_after = bool(args.get("capture_after"))
 
@@ -321,6 +384,7 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
         if mode not in {"som", "vision", "ax"}:
             return json.dumps({"error": f"bad mode {mode!r}; use som|vision|ax"})
         cap = backend.capture(mode=mode, app=args.get("app"))
+        _inspect_captured_app_text(cap)
         return _capture_response(cap, max_elements=_coerce_max_elements(args.get("max_elements")))
 
     if action == "wait":
