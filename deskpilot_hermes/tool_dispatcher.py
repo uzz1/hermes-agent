@@ -1,4 +1,5 @@
 import json
+import logging
 from collections.abc import Mapping
 from importlib import metadata, resources
 from pathlib import Path
@@ -24,6 +25,8 @@ from deskpilot_hermes.policy import PolicyReply
 from deskpilot_hermes.provenance import DeskPilotProvenance, require_provenance
 from deskpilot_hermes.validation import validate_uuid
 
+
+logger = logging.getLogger(__name__)
 
 assert ActionRegistry.__module__ == "deskpilot.actions"
 
@@ -218,5 +221,13 @@ class DeskPilotToolDispatcher:
             if not isinstance(observed, dict):
                 raise ValueError("observations must be an object")
             return observed
-        except Exception:
+        except Exception as cause:
+            # The model-facing message stays generic on purpose — a denial must
+            # not teach the model how to shape a passing request. But dropping
+            # the cause entirely made three distinct defects present identically
+            # with no __cause__ to follow, so the real reason is logged locally.
+            logger.warning(
+                "DeskPilot execution denied for %s: %s: %s",
+                tool_name, type(cause).__name__, cause,
+            )
             raise ExecutionDenied("DeskPilot execution denied") from None
