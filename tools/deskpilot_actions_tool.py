@@ -35,6 +35,64 @@ def _packaged_action_specs() -> dict[tuple[str, int], Any]:
     return dict(parent_registry._specs)
 
 
+_JSON_TYPES: tuple[tuple[type, str], ...] = (
+    (bool, "boolean"),
+    (int, "integer"),
+    (float, "number"),
+    (str, "string"),
+)
+
+
+def _json_type_of(values: list[Any]) -> str:
+    """Name the JSON type shared by a set of enum values."""
+    kinds = {
+        name for value in values for kind, name in _JSON_TYPES if isinstance(value, kind)
+    }
+    # bool is a subclass of int; prefer the narrower name when every value is one.
+    if kinds == {"boolean", "integer"}:
+        return "boolean"
+    return kinds.pop() if len(kinds) == 1 else "string"
+
+
+def _model_facing_schema(schema: Any) -> Any:
+    """Return a copy of ``schema`` that the pinned model can actually render.
+
+    ``enum`` is removed everywhere and its values are folded into the field's
+    description. gemma-4-e4b's chat template raises on ``enum`` — bare, it hits
+    an undefined-value filter; typed, it hits an unimplemented Jinja test — and
+    because every tool ships in one request, a single occurrence breaks the turn.
+
+    This narrows only what the model is shown. ``ActionRegistry`` keeps the
+    original schema and remains the enforcement point, so a model that invents a
+    value outside the list is still refused at dispatch.
+    """
+    if isinstance(schema, list):
+        return [_model_facing_schema(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+
+    rendered = {
+        key: _model_facing_schema(value)
+        for key, value in schema.items()
+        if key not in ("enum", "const")
+    }
+    # `const` is `enum` with one member and fails the same way, so both are
+    # folded into a description the template can render.
+    values = schema.get("enum")
+    if not isinstance(values, list) and "const" in schema:
+        values = [schema["const"]]
+    if isinstance(values, list) and values:
+        rendered.setdefault("type", _json_type_of(values))
+        permitted = (
+            f"Must be: {values[0]}."
+            if len(values) == 1
+            else "One of: " + ", ".join(str(value) for value in values) + "."
+        )
+        existing = rendered.get("description")
+        rendered["description"] = f"{existing} {permitted}".strip() if existing else permitted
+    return rendered
+
+
 def _prepare_registrations(
     action_specs: Mapping[tuple[str, int], Any],
 ) -> list[dict[str, Any]]:
@@ -54,7 +112,7 @@ def _prepare_registrations(
                 "description": (
                     f"Execute authorized DeskPilot action {action_id}@{action_version}."
                 ),
-                "parameters": copy.deepcopy(spec.inputSchema),
+                "parameters": _model_facing_schema(spec.inputSchema),
             },
             "handler": _require_public_policy_wrapper,
             "check_fn": _deskpilot_mode_enabled,

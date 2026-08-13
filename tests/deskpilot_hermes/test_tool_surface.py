@@ -9,6 +9,7 @@ import model_tools
 from deskpilot.actions import ActionRegistry, POSTCONDITIONS, PRECONDITIONS
 from deskpilot_hermes.integration import TOOL_ACTIONS
 from deskpilot_hermes.tool_dispatcher import _packaged_actions_path
+from tools.deskpilot_actions_tool import _model_facing_schema
 from tools.registry import (
     ToolRegistry,
     discover_builtin_tools,
@@ -104,7 +105,12 @@ def test_visible_definitions_copy_parent_schemas_and_identify_actions(monkeypatc
         assert function["description"] == (
             f"Execute authorized DeskPilot action {action_id}@{action_version}."
         )
-        assert function["parameters"] == specs[(action_id, action_version)].inputSchema
+        # The model is shown a narrowed copy, not the enforcement schema: enum
+        # crashes the pinned model's chat template. ActionRegistry keeps the
+        # original and remains the gate — see test_model_schema.py.
+        assert function["parameters"] == _model_facing_schema(
+            specs[(action_id, action_version)].inputSchema
+        )
         assert (
             function["parameters"] is not specs[(action_id, action_version)].inputSchema
         )
@@ -330,7 +336,9 @@ def test_registered_parameters_are_detached_from_parent_and_mapping(monkeypatch)
     specs[first_action].inputSchema["mutated_after_registration"] = True
 
     entry = isolated.get_entry(first_name)
-    assert entry.schema["parameters"] == original[first_action].inputSchema
+    assert entry.schema["parameters"] == _model_facing_schema(
+        original[first_action].inputSchema
+    )
     assert "mutated_after_registration" not in entry.schema["parameters"]
 
 
