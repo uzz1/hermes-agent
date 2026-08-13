@@ -766,3 +766,25 @@ async def test_session_cancel_revokes_pending_permission_and_parent_trace(monkey
             },
         )
     ]
+
+
+def test_default_lease_verifier_defers_to_the_configured_ui_identity(monkeypatch, tmp_path):
+    """The reader must not pin its own identity.
+
+    It resolves the closed allowlist the parent policy server reads, so both
+    sides of the lease agree; with nothing configured that is production only,
+    with ad-hoc signatures refused.
+    """
+    import deskpilot.config
+
+    monkeypatch.delenv("DESKPILOT_CONFIG", raising=False)
+    default = LiveUILeaseReader(tmp_path / "ui-lease").identity_verifier
+    assert default.allowed_identifiers == frozenset({"com.uzz1.deskpilot"})
+    assert default.allow_adhoc_signature is False
+
+    sentinel = object()
+    monkeypatch.setattr(deskpilot.config, "ui_identity_verifier", lambda *args: sentinel)
+    assert LiveUILeaseReader(tmp_path / "ui-lease").identity_verifier is sentinel
+    # An explicitly injected verifier still wins over the configured one.
+    injected = lambda _pid: True
+    assert LiveUILeaseReader(tmp_path / "ui-lease", injected).identity_verifier is injected

@@ -15,9 +15,13 @@ class LiveUILeaseReader:
             Path(path) if path is not None else Path.home() / ".deskpilot/run/ui-lease"
         )
         if identity_verifier is None:
-            from deskpilot.policy_server import MacOSCodeIdentityVerifier
+            # Resolved from the same DESKPILOT_CONFIG the policy server reads, so
+            # the reader and the server agree on one closed allowlist instead of
+            # this side silently pinning a different identity. Falls back to the
+            # production-only default when unset, never wider.
+            from deskpilot.config import ui_identity_verifier
 
-            identity_verifier = MacOSCodeIdentityVerifier()
+            identity_verifier = ui_identity_verifier()
         self.identity_verifier = identity_verifier
 
     def _validate_private_ancestors(self) -> None:
