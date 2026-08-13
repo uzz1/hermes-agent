@@ -341,11 +341,12 @@ class HammerspoonAdapter:
 
 
 def default_adapters():
-    request_dir = Path.home() / ".deskpilot/run/hammerspoon"
+    # HammerspoonExecutor's second positional parameter is the request *file*
+    # path, not a directory. Its default -- ~/.deskpilot/run/hammerspoon-request.json
+    # -- is the exact path ~/.hammerspoon/deskpilot/ipc.lua reads, so the
+    # rendezvous only lines up when the default is left alone.
     return {
-        "hammerspoon": HammerspoonAdapter(
-            HammerspoonExecutor(SubprocessRunner(), request_dir)
-        ),
+        "hammerspoon": HammerspoonAdapter(HammerspoonExecutor(SubprocessRunner())),
         "browseros": BrowserMessagingAdapter(),
         "cua": CuaAdapter(),
         "terminal": TerminalAdapter(),
