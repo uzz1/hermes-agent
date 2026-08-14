@@ -1,3 +1,4 @@
+import ctypes
 import json
 import os
 import shutil
@@ -10,7 +11,11 @@ from urllib.parse import urlsplit
 
 from jsonschema import Draft202012Validator
 
-from deskpilot.executors.hammerspoon import HammerspoonExecutor, SubprocessRunner
+from deskpilot.executors.hammerspoon import (
+    HammerspoonExecutor,
+    SubprocessRunner,
+    hammerspoon_accessibility_trusted,
+)
 from deskpilot.traces import TraceStore
 from deskpilot_hermes.integration import ACTION_EXECUTORS
 from deskpilot_hermes.policy import ParentPolicyClient
@@ -412,6 +417,15 @@ def build_environment_probes():
             return []
 
     def accessibility(_inputs):
+        """Legacy Hermes-context probe. Only ``message.send`` still uses it.
+
+        It asks whichever app is responsible for *this* process, which is the
+        authority for no DeskPilot executor. It is kept unchanged rather than
+        removed because ``message.send`` is a mutation-risk action and a gate
+        must not be dropped to make something pass; its real authority is the
+        messaging platform's credentials, for which no probe exists yet. The
+        probe denies, which is the safe direction. Do not add users to it.
+        """
         result = subprocess.run(
             [
                 "/usr/bin/osascript",
@@ -424,6 +438,36 @@ def build_environment_probes():
         )
         return result.returncode == 0 and result.stdout.strip().casefold() == "true"
 
+    def hammerspoon_accessibility(_inputs):
+        """The Hammerspoon process's own AX grant — the hammerspoon authority.
+
+        Evaluated inside the running Hammerspoon app via hs.ipc, so the answer
+        does not depend on this process's own trust. Fail-closed.
+        """
+        return hammerspoon_accessibility_trusted()
+
+    def cua_accessibility(_inputs):
+        """This process's AX trust — the authority for the cua executor.
+
+        ``cua_ready`` proves only that the cua-driver binary resolves and its
+        heartbeat is fresh (``CuaDriverBackend.is_available()`` is macOS plus
+        ``shutil.which('cua-driver')``); it establishes nothing about TCC. The
+        cua-driver runs as a stdio child of this process, so the grant that
+        governs its AX calls is this process's, read directly rather than
+        through osascript — which would additionally require the separate
+        Automation grant for System Events and report its absence as though it
+        were a missing Accessibility grant.
+        """
+        try:
+            framework = ctypes.CDLL(
+                "/System/Library/Frameworks/ApplicationServices.framework"
+                "/ApplicationServices"
+            )
+            framework.AXIsProcessTrusted.restype = ctypes.c_bool
+            return framework.AXIsProcessTrusted() is True
+        except (OSError, AttributeError):
+            return False
+
     def local_ui(_inputs):
         lease = run / "ui-lease"
         try:
@@ -435,6 +479,8 @@ def build_environment_probes():
         return path is not None and (path == home or home in path.parents)
 
     return {
+        "hammerspoon_accessibility": hammerspoon_accessibility,
+        "cua_accessibility": cua_accessibility,
         "accessibility": accessibility,
         "zed_running": _process_running("Zed"),
         "ghostty_running": _process_running("Ghostty"),
@@ -489,6 +535,8 @@ _installed_dispatcher = None
 def install_deskpilot_runtime(environment, adapters=None):
     global _installed_dispatcher
     required = {
+        "hammerspoon_accessibility",
+        "cua_accessibility",
         "accessibility",
         "zed_running",
         "ghostty_running",
